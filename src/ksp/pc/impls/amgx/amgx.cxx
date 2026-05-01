@@ -129,8 +129,14 @@ struct PC_AMGX {
   void       *lib_handle = 0;
   std::string cfg_contents;
 
-  // Cached state for re-setup
+  // Cached state for re-setup. Counts here are SCALAR-coordinate quantities
+  // (i.e. matching the underlying MATAIJ's row/column space). When the
+  // matrix advertises a block size > 1, AMGX's matrix and replace-coefficient
+  // calls take BLOCK-coordinate counts derived from these (nLocalRows / bSize,
+  // and nnzBlocks). nnzBlocks is populated by PCSetUp_AMGX on the slow path
+  // and re-validated on the fast path; for bSize == 1 it equals nnz.
   PetscInt           nnz;
+  PetscInt           nnzBlocks;
   PetscInt           nLocalRows;
   PetscInt           nGlobalRows;
   PetscInt           bSize;
@@ -200,6 +206,143 @@ static PetscErrorCode amgx_output_messages(PC_AMGX *amgx)
   } while (0)
 
 /*
+   PCAMGXBuildBlockCSR_Private - Repack a host-resident scalar AIJ CSR matrix
+   into block-coordinate CSR with block-major (row-major within block) values,
+   suitable for AMGX_matrix_upload_distributed when bSize > 1.
+
+   AMGX expects, when blockDimX = blockDimY = bSize > 1:
+     - row offsets and column indices in BLOCK coordinates (length
+       nBlockRows+1 and nnzBlocks respectively, where nBlockRows = nScalarRows
+       / bSize)
+     - values stored block-major: for the k-th block,
+         values[k * bSize * bSize + r * bSize + c]  is the entry at
+         (block-row, block-col) (k -> iBlk, jBlk(k)) at intra-block position
+         (r, c). Within each block, layout is row-major.
+
+   PETSc MATAIJ stores scalar CSR. When the user advertises bSize > 1 (via
+   MatSetBlockSize, or implicitly via DMDA with ndof > 1), the scalar CSR may
+   not contain every (r, c) entry inside each block — some intra-block entries
+   may be structurally absent. We "densify" each block: for every (iBlk, jBlk)
+   block touched by any of the bSize scalar rows, we materialize the full
+   bSize * bSize block, padding missing scalar entries with 0.0. This matches
+   how other PETSc bindings (e.g. PCHYPRE) hand block matrices to libraries
+   that demand full BAIJ-style storage.
+
+   The function does the repack on the host. For matrices whose values live
+   on the device, the caller must copy them to a host buffer first.
+
+   Inputs:
+     bSize        - block size (>= 2; caller handles bSize == 1 separately)
+     nScalarRows  - local rows in the scalar AIJ representation
+                    (must be divisible by bSize)
+     scalarRowOff - host array, length nScalarRows + 1
+     scalarColIdx - host array, length scalarRowOff[nScalarRows]
+     scalarValues - host array, length scalarRowOff[nScalarRows]
+
+   Outputs (written into the std::vector& parameters; caller need not pre-size):
+     blockRowOff  - length nBlockRows + 1; AMGX-compatible int
+     blockColIdx  - length nnzBlocks
+     blockValues  - length nnzBlocks * bSize * bSize, block-major / row-major
+     nnzBlocksOut - number of block nonzeros (also implicit in
+                    blockRowOff.back())
+*/
+static PetscErrorCode PCAMGXBuildBlockCSR_Private(PetscInt bSize,
+                                                  PetscInt nScalarRows,
+                                                  const PetscInt    *scalarRowOff,
+                                                  const PetscInt    *scalarColIdx,
+                                                  const PetscScalar *scalarValues,
+                                                  std::vector<int>         &blockRowOff,
+                                                  std::vector<int>         &blockColIdx,
+                                                  std::vector<PetscScalar> &blockValues,
+                                                  PetscInt                 *nnzBlocksOut)
+{
+  PetscFunctionBegin;
+  PetscCheck(bSize >= 1, PETSC_COMM_SELF, PETSC_ERR_PLIB,
+             "PCAMGX repack: bSize=%" PetscInt_FMT " is invalid (must be >= 1)", bSize);
+  PetscCheck(nScalarRows % bSize == 0, PETSC_COMM_SELF, PETSC_ERR_ARG_WRONG,
+             "PCAMGX repack: scalar local rows %" PetscInt_FMT
+             " is not divisible by bSize=%" PetscInt_FMT, nScalarRows, bSize);
+
+  const PetscInt nBlockRows = nScalarRows / bSize;
+
+  /* Pass 1: for each block row, gather the union of touched block columns
+     across the bSize composing scalar rows. We collect into a per-row
+     scratch vector then sort/unique, rather than std::set, to limit
+     allocator pressure for typical FE/HDG matrices where each block row
+     has ~10s of block neighbors. */
+  std::vector<std::vector<int>> blockColsPerRow((size_t)nBlockRows);
+  for (PetscInt iBlk = 0; iBlk < nBlockRows; ++iBlk) {
+    std::vector<int> &cols = blockColsPerRow[(size_t)iBlk];
+    /* upper bound on size: total scalar nnz across the bSize scalar rows */
+    PetscInt budget = 0;
+    for (PetscInt r = 0; r < bSize; ++r) {
+      const PetscInt iScalar = iBlk * bSize + r;
+      budget += scalarRowOff[iScalar + 1] - scalarRowOff[iScalar];
+    }
+    cols.reserve((size_t)budget);
+    for (PetscInt r = 0; r < bSize; ++r) {
+      const PetscInt iScalar = iBlk * bSize + r;
+      const PetscInt rs      = scalarRowOff[iScalar];
+      const PetscInt re      = scalarRowOff[iScalar + 1];
+      for (PetscInt k = rs; k < re; ++k) {
+        cols.push_back((int)(scalarColIdx[k] / bSize));
+      }
+    }
+    std::sort(cols.begin(), cols.end());
+    cols.erase(std::unique(cols.begin(), cols.end()), cols.end());
+  }
+
+  /* Pass 2: prefix sum of per-row sizes to get blockRowOff. */
+  blockRowOff.assign((size_t)(nBlockRows + 1), 0);
+  for (PetscInt iBlk = 0; iBlk < nBlockRows; ++iBlk) {
+    blockRowOff[(size_t)(iBlk + 1)] =
+      blockRowOff[(size_t)iBlk] + (int)blockColsPerRow[(size_t)iBlk].size();
+  }
+  const PetscInt nnzBlocks = (PetscInt)blockRowOff[(size_t)nBlockRows];
+  PetscCheck(nnzBlocks <= std::numeric_limits<int>::max(), PETSC_COMM_SELF, PETSC_ERR_PLIB,
+             "PCAMGX repack: block nnz %" PetscInt_FMT " exceeds int range; "
+             "AMGX restricts block nnz to 32-bit indices.", nnzBlocks);
+
+  /* Pass 3: flatten per-row block-column lists into blockColIdx, init values to 0. */
+  blockColIdx.resize((size_t)nnzBlocks);
+  for (PetscInt iBlk = 0; iBlk < nBlockRows; ++iBlk) {
+    const std::vector<int> &cols = blockColsPerRow[(size_t)iBlk];
+    std::copy(cols.begin(), cols.end(),
+              blockColIdx.begin() + blockRowOff[(size_t)iBlk]);
+  }
+  blockValues.assign((size_t)nnzBlocks * (size_t)bSize * (size_t)bSize, (PetscScalar)0.0);
+
+  /* Pass 4: scatter scalar entries into block-major positions.
+     For each scalar (iScalar, jScalar, value), find its containing block
+     (iBlk, jBlk) and intra-block position (r, c). Locate jBlk's slot via
+     binary search within the block row's sorted block-col list. */
+  for (PetscInt iBlk = 0; iBlk < nBlockRows; ++iBlk) {
+    const std::vector<int> &cols   = blockColsPerRow[(size_t)iBlk];
+    const PetscInt          kStart = blockRowOff[(size_t)iBlk];
+    for (PetscInt r = 0; r < bSize; ++r) {
+      const PetscInt iScalar = iBlk * bSize + r;
+      const PetscInt rs      = scalarRowOff[iScalar];
+      const PetscInt re      = scalarRowOff[iScalar + 1];
+      for (PetscInt k = rs; k < re; ++k) {
+        const PetscInt jScalar = scalarColIdx[k];
+        const int      jBlk    = (int)(jScalar / bSize);
+        const PetscInt c       = jScalar - (PetscInt)jBlk * bSize;
+        auto it = std::lower_bound(cols.begin(), cols.end(), jBlk);
+        PetscCheck(it != cols.end() && *it == jBlk, PETSC_COMM_SELF, PETSC_ERR_PLIB,
+                   "PCAMGX repack: block-col index lookup failed (iBlk=%" PetscInt_FMT
+                   ", jBlk=%d) — internal invariant broken.", iBlk, jBlk);
+        const PetscInt kBlk = kStart + (PetscInt)(it - cols.begin());
+        blockValues[(size_t)kBlk * (size_t)bSize * (size_t)bSize
+                    + (size_t)r * (size_t)bSize + (size_t)c] = scalarValues[k];
+      }
+    }
+  }
+
+  *nnzBlocksOut = nnzBlocks;
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+/*
    PCSetUp_AMGX - Prepares for the use of the AmgX preconditioner
                     by setting data structures and options.
 
@@ -217,9 +360,21 @@ static PetscErrorCode PCSetUp_AMGX(PC pc)
   PC_AMGX  *amgx = (PC_AMGX *)pc->data;
   Mat       Pmat = pc->pmat;
   PetscBool is_dev_ptrs;
+  PetscBool is_baij;
 
   PetscFunctionBegin;
   PetscCall(PetscObjectTypeCompareAny((PetscObject)Pmat, &is_dev_ptrs, MATAIJCUSPARSE, MATSEQAIJCUSPARSE, MATMPIAIJCUSPARSE, ""));
+  /* PCAMGX uses scalar AIJ as its canonical input form. MATBAIJ is rejected
+     here with a directive to convert; this preserves the bSize metadata via
+     MatConvert and lets the AIJ + bSize > 1 path below handle the block
+     repack. (There is also no GPU BAIJ in PETSc, so requiring BAIJ would
+     defeat the GPU AMGX path entirely.) */
+  PetscCall(PetscObjectTypeCompareAny((PetscObject)Pmat, &is_baij, MATBAIJ, MATSEQBAIJ, MATMPIBAIJ, ""));
+  PetscCheck(!is_baij, PetscObjectComm((PetscObject)Pmat), PETSC_ERR_SUP,
+             "PCAMGX does not accept MATBAIJ matrices directly. Convert to MATAIJ "
+             "(block-size metadata is preserved) via "
+             "MatConvert(A, MATAIJ, MAT_INPLACE_MATRIX, &A); PCAMGX will repack "
+             "the scalar AIJ into AMGX's block layout internally.");
 
   // At the present time, an AmgX matrix is a sequential matrix
   // Non-sequential/MPI matrices must be adapted to extract the local matrix
@@ -258,7 +413,9 @@ static PetscErrorCode PCSetUp_AMGX(PC pc)
     PetscCallAmgX(AMGX_solver_create(&amgx->solver, amgx->rsrc, AMGX_mode_dDDI, amgx->cfg));
     amgx->solve_state_init = true;
 
-    // Extract the CSR data
+    // Extract the (scalar) CSR data. MatGetRowIJ returns scalar coordinates
+    // for MATAIJ regardless of advertised block size; we re-pack into
+    // block-coordinate CSR below when bSize > 1.
     PetscBool       done;
     const PetscInt *colIndices;
     const PetscInt *rowOffsets;
@@ -274,7 +431,7 @@ static PetscErrorCode PCSetUp_AMGX(PC pc)
 
     PetscCheck(amgx->nnz < std::numeric_limits<int>::max(), PETSC_COMM_SELF, PETSC_ERR_PLIB, "Support for 64-bit integer nnz not yet implemented, nnz = %" PetscInt_FMT ".", amgx->nnz);
 
-    // Allocate space for some partition offsets
+    // Allocate space for some partition offsets (in scalar coords).
     std::vector<PetscInt> partitionOffsets(amgx->nranks + 1);
 
     // Fetch the number of local rows per rank
@@ -282,18 +439,88 @@ static PetscErrorCode PCSetUp_AMGX(PC pc)
     PetscCallMPI(MPI_Allgather(&amgx->nLocalRows, 1, MPIU_INT, partitionOffsets.data() + 1, 1, MPIU_INT, amgx->comm));
     std::partial_sum(partitionOffsets.begin(), partitionOffsets.end(), partitionOffsets.begin());
 
-    // Fetch the number of global rows
+    // Fetch the number of global rows (scalar)
     amgx->nGlobalRows = partitionOffsets[amgx->nranks];
 
     PetscCall(MatGetBlockSize(Pmat, &amgx->bSize));
+    PetscCheck(amgx->bSize >= 1, amgx->comm, PETSC_ERR_PLIB,
+               "MatGetBlockSize returned bSize=%" PetscInt_FMT " (must be >= 1)", amgx->bSize);
+    PetscCheck(amgx->nLocalRows % amgx->bSize == 0, amgx->comm, PETSC_ERR_ARG_WRONG,
+               "Local row count %" PetscInt_FMT " is not divisible by advertised block size %" PetscInt_FMT
+               "; PCAMGX cannot repack a partial block row.",
+               amgx->nLocalRows, amgx->bSize);
 
     // XXX Currently constrained to 32-bit indices, to be changed in the future
     // Create the distribution and upload the matrix data
     AMGX_distribution_handle dist;
     PetscCallAmgX(AMGX_distribution_create(&dist, amgx->cfg));
     PetscCallAmgX(AMGX_distribution_set_32bit_colindices(dist, true));
-    PetscCallAmgX(AMGX_distribution_set_partition_data(dist, AMGX_DIST_PARTITION_OFFSETS, partitionOffsets.data()));
-    PetscCallAmgX(AMGX_matrix_upload_distributed(amgx->A, amgx->nGlobalRows, (int)amgx->nLocalRows, (int)amgx->nnz, amgx->bSize, amgx->bSize, rowOffsets, colIndices, amgx->values, NULL, dist));
+
+    if (amgx->bSize == 1) {
+      /* Scalar path. Pass scalar partition offsets and scalar CSR directly.
+         (For the GPU case, rowOffsets/colIndices are host pointers but
+         values is a device pointer; AMGX's upload internally detects each
+         pointer's residency via cudaPointerGetAttributes.) */
+      amgx->nnzBlocks = amgx->nnz;
+      PetscCallAmgX(AMGX_distribution_set_partition_data(dist, AMGX_DIST_PARTITION_OFFSETS, partitionOffsets.data()));
+      PetscCallAmgX(AMGX_matrix_upload_distributed(amgx->A,
+                                                   amgx->nGlobalRows,
+                                                   (int)amgx->nLocalRows,
+                                                   (int)amgx->nnz,
+                                                   1, 1,
+                                                   rowOffsets, colIndices, amgx->values,
+                                                   NULL, dist));
+    } else {
+      /* Block path. AMGX wants block-coordinate row/col indices, block-major
+         values, and block-coordinate partition offsets. The MATAIJ scalar CSR
+         we have here uses scalar coordinates, so we repack on the host. */
+      const PetscScalar       *hostValues = nullptr;
+      std::vector<PetscScalar> hostValuesBuf;
+      if (is_dev_ptrs) {
+        hostValuesBuf.resize((size_t)amgx->nnz);
+        PetscCallCUDA(cudaMemcpy(hostValuesBuf.data(), amgx->values,
+                                 (size_t)amgx->nnz * sizeof(PetscScalar),
+                                 cudaMemcpyDeviceToHost));
+        hostValues = hostValuesBuf.data();
+      } else {
+        hostValues = amgx->values;
+      }
+
+      std::vector<int>         blockRowOff;
+      std::vector<int>         blockColIdx;
+      std::vector<PetscScalar> blockValues;
+      PetscInt                 nnzBlocks = 0;
+      PetscCall(PCAMGXBuildBlockCSR_Private(amgx->bSize, amgx->nLocalRows,
+                                            rowOffsets, colIndices, hostValues,
+                                            blockRowOff, blockColIdx, blockValues,
+                                            &nnzBlocks));
+      amgx->nnzBlocks = nnzBlocks;
+
+      /* All ranks' partition boundaries must align to bSize because block rows
+         are inseparable across rank boundaries. */
+      std::vector<int> blockPartitionOffsets(amgx->nranks + 1);
+      for (PetscInt r = 0; r <= amgx->nranks; ++r) {
+        PetscCheck(partitionOffsets[r] % amgx->bSize == 0, amgx->comm, PETSC_ERR_PLIB,
+                   "Partition offset %" PetscInt_FMT " (rank %" PetscInt_FMT
+                   ") is not aligned to bSize=%" PetscInt_FMT
+                   "; block rows must not straddle rank boundaries.",
+                   partitionOffsets[r], r, amgx->bSize);
+        blockPartitionOffsets[(size_t)r] = (int)(partitionOffsets[r] / amgx->bSize);
+      }
+
+      const int nBlockRowsGlobal = (int)(amgx->nGlobalRows / amgx->bSize);
+      const int nBlockRowsLocal  = (int)(amgx->nLocalRows / amgx->bSize);
+
+      PetscCallAmgX(AMGX_distribution_set_partition_data(dist, AMGX_DIST_PARTITION_OFFSETS, blockPartitionOffsets.data()));
+      PetscCallAmgX(AMGX_matrix_upload_distributed(amgx->A,
+                                                   nBlockRowsGlobal,
+                                                   nBlockRowsLocal,
+                                                   (int)nnzBlocks,
+                                                   (int)amgx->bSize, (int)amgx->bSize,
+                                                   blockRowOff.data(), blockColIdx.data(), blockValues.data(),
+                                                   NULL, dist));
+    }
+
     PetscCallAmgX(AMGX_solver_setup(amgx->solver, amgx->A));
     PetscCallAmgX(AMGX_vector_bind(amgx->sol, amgx->A));
     PetscCallAmgX(AMGX_vector_bind(amgx->rhs, amgx->A));
@@ -302,7 +529,57 @@ static PetscErrorCode PCSetUp_AMGX(PC pc)
     PetscCall(MatRestoreRowIJ(amgx->localA, 0, PETSC_FALSE, PETSC_FALSE, &nlr, &rowOffsets, &colIndices, &done));
   } else {
     // The fast path for if the sparsity pattern persists
-    PetscCallAmgX(AMGX_matrix_replace_coefficients(amgx->A, amgx->nLocalRows, amgx->nnz, amgx->values, NULL));
+    if (amgx->bSize == 1) {
+      PetscCallAmgX(AMGX_matrix_replace_coefficients(amgx->A, amgx->nLocalRows, amgx->nnz, amgx->values, NULL));
+    } else {
+      /* Sparsity persists, but values changed. Repack the new scalar values
+         into block-major form. (We re-derive the block sparsity pattern; an
+         optional optimization is to cache the rowOff/colIdx mapping from the
+         slow path and only reshuffle values, but the cost of re-derivation is
+         small relative to GPU upload + solve.) */
+      PetscBool       done;
+      const PetscInt *colIndices;
+      const PetscInt *rowOffsets;
+      PetscInt        nLocalRowsCheck = 0;
+      PetscCall(MatGetRowIJ(amgx->localA, 0, PETSC_FALSE, PETSC_FALSE, &nLocalRowsCheck, &rowOffsets, &colIndices, &done));
+      PetscCheck(done, amgx->comm, PETSC_ERR_PLIB, "MatGetRowIJ was not successful (fast path)");
+
+      const PetscScalar       *hostValues = nullptr;
+      std::vector<PetscScalar> hostValuesBuf;
+      if (is_dev_ptrs) {
+        hostValuesBuf.resize((size_t)amgx->nnz);
+        PetscCallCUDA(cudaMemcpy(hostValuesBuf.data(), amgx->values,
+                                 (size_t)amgx->nnz * sizeof(PetscScalar),
+                                 cudaMemcpyDeviceToHost));
+        hostValues = hostValuesBuf.data();
+      } else {
+        hostValues = amgx->values;
+      }
+
+      std::vector<int>         blockRowOff;
+      std::vector<int>         blockColIdx;
+      std::vector<PetscScalar> blockValues;
+      PetscInt                 nnzBlocks = 0;
+      PetscCall(PCAMGXBuildBlockCSR_Private(amgx->bSize, amgx->nLocalRows,
+                                            rowOffsets, colIndices, hostValues,
+                                            blockRowOff, blockColIdx, blockValues,
+                                            &nnzBlocks));
+      PetscCheck(nnzBlocks == amgx->nnzBlocks, amgx->comm, PETSC_ERR_PLIB,
+                 "PCAMGX fast path: block-nnz changed (was %" PetscInt_FMT
+                 ", now %" PetscInt_FMT
+                 "); the caller marked SAME_NONZERO_PATTERN but the sparsity "
+                 "differs from the previous setup.",
+                 amgx->nnzBlocks, nnzBlocks);
+
+      const int nBlockRowsLocal = (int)(amgx->nLocalRows / amgx->bSize);
+      PetscCallAmgX(AMGX_matrix_replace_coefficients(amgx->A,
+                                                     nBlockRowsLocal,
+                                                     (int)nnzBlocks,
+                                                     blockValues.data(), NULL));
+
+      PetscInt nlr = 0;
+      PetscCall(MatRestoreRowIJ(amgx->localA, 0, PETSC_FALSE, PETSC_FALSE, &nlr, &rowOffsets, &colIndices, &done));
+    }
     PetscCallAmgX(AMGX_solver_resetup(amgx->solver, amgx->A));
   }
 
@@ -345,8 +622,14 @@ static PetscErrorCode PCApply_AMGX(PC pc, Vec b, Vec x)
     PetscCall(VecGetArrayRead(b, &b_));
   }
 
-  PetscCallAmgX(AMGX_vector_upload(amgx->sol, amgx->nLocalRows, 1, x_));
-  PetscCallAmgX(AMGX_vector_upload(amgx->rhs, amgx->nLocalRows, 1, b_));
+  /* AMGX_vector_upload(handle, n, block_dim, data) takes n = number of block
+     entries and block_dim = block size, with total scalars = n * block_dim.
+     For bSize == 1 this reduces to the scalar form (n = nLocalRows,
+     block_dim = 1). The vector dims must agree with the AMGX matrix's block
+     layout, which is set in PCSetUp_AMGX. */
+  const int nBlockRowsLocal = (int)(amgx->nLocalRows / amgx->bSize);
+  PetscCallAmgX(AMGX_vector_upload(amgx->sol, nBlockRowsLocal, (int)amgx->bSize, x_));
+  PetscCallAmgX(AMGX_vector_upload(amgx->rhs, nBlockRowsLocal, (int)amgx->bSize, b_));
   PetscCallAmgX(AMGX_solver_solve_with_0_initial_guess(amgx->solver, amgx->rhs, amgx->sol));
 
   AMGX_SOLVE_STATUS status;
@@ -496,14 +779,19 @@ static PetscErrorCode PCSetFromOptions_AMGX(PC pc, PetscOptionItems PetscOptions
   PetscCall(PetscOptionsString("-pc_amgx_selector", "AmgX Selector", "", option, option, MAX_PARAM_LEN, NULL));
   PetscCheck(AmgXControlMap::Selectors.count(option) == 1, PETSC_COMM_SELF, PETSC_ERR_PLIB, "Selector %s not registered for AmgX.", option);
 
-  // Double check that the user has selected an appropriate selector for the AMG method
+  /* Validate the selector against the AMG method. Use the just-parsed
+     selector (held in `option`), not the cached `amgx->selector` from a
+     previous PCSetFromOptions call — otherwise switching from CLASSICAL
+     (default selector PMIS) to AGGREGATION + an explicit selector like
+     SIZE_2 is rejected even though both are valid in isolation. */
+  const AmgXSelector parsed_selector = AmgXControlMap::Selectors.at(option);
   if (amgx->amg_method == AmgXAMGMethod::Classical) {
-    PetscCheck(amgx->selector == AmgXSelector::PMIS || amgx->selector == AmgXSelector::HMIS, amgx->comm, PETSC_ERR_PLIB, "Chosen selector is not used for AmgX Classical AMG: selector=%s", option);
+    PetscCheck(parsed_selector == AmgXSelector::PMIS || parsed_selector == AmgXSelector::HMIS, amgx->comm, PETSC_ERR_PLIB, "Chosen selector is not used for AmgX Classical AMG: selector=%s", option);
     amgx->cfg_contents += "amg:interpolator=D2,";
   } else if (amgx->amg_method == AmgXAMGMethod::Aggregation) {
-    PetscCheck(amgx->selector == AmgXSelector::Size2 || amgx->selector == AmgXSelector::Size4 || amgx->selector == AmgXSelector::Size8 || amgx->selector == AmgXSelector::MultiPairwise, amgx->comm, PETSC_ERR_PLIB, "Chosen selector is not used for AmgX Aggregation AMG");
+    PetscCheck(parsed_selector == AmgXSelector::Size2 || parsed_selector == AmgXSelector::Size4 || parsed_selector == AmgXSelector::Size8 || parsed_selector == AmgXSelector::MultiPairwise, amgx->comm, PETSC_ERR_PLIB, "Chosen selector is not used for AmgX Aggregation AMG: selector=%s (valid: SIZE_2, SIZE_4, SIZE_8, MULTI_PAIRWISE)", option);
   }
-  amgx->selector = AmgXControlMap::Selectors.at(option);
+  amgx->selector = parsed_selector;
   amgx->cfg_contents += "amg:selector=" + std::string(option) + ",";
 
   // Set presweeps
