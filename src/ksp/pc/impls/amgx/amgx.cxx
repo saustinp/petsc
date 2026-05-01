@@ -397,18 +397,35 @@ static PetscErrorCode PCDestroy_AMGX(PC pc)
   PC_AMGX *amgx = (PC_AMGX *)pc->data;
 
   PetscFunctionBegin;
+  /* Each teardown is guarded on whether the corresponding handle was
+     actually allocated. The setup path can fail at multiple intermediate
+     points (e.g. invalid option in PCSetFromOptions_AMGX, or
+     AMGX_resources_create not yet reached in PCSetUp_AMGX), leaving the
+     PC partially initialized. The destructor must tolerate that without
+     itself raising a second error and triggering MPI_Abort.
+
+     The struct was allocated via PetscNew (zero-fills) in PCCreate_AMGX,
+     so all handle members default to null / MPI_COMM_NULL until set. */
   /* decrease the number of instances, only the last instance need to destroy resource and finalizing AmgX */
   if (s_count == 1) {
     /* can put this in a PCAMGXInitializePackage method */
-    PetscCheck(amgx->rsrc != nullptr, PETSC_COMM_SELF, PETSC_ERR_PLIB, "s_rsrc == NULL");
-    PetscCallAmgX(AMGX_resources_destroy(amgx->rsrc));
+    if (amgx->rsrc) {
+      PetscCallAmgX(AMGX_resources_destroy(amgx->rsrc));
+      amgx->rsrc = nullptr;
+    }
     /* destroy config (need to use AMGX_SAFE_CALL after this point) */
-    PetscCallAmgX(AMGX_config_destroy(amgx->cfg));
+    if (amgx->cfg) {
+      PetscCallAmgX(AMGX_config_destroy(amgx->cfg));
+      amgx->cfg = nullptr;
+    }
     PetscCallAmgX(AMGX_finalize_plugins());
     PetscCallAmgX(AMGX_finalize());
-    PetscCallMPI(MPI_Comm_free(&amgx->comm));
+    if (amgx->comm != MPI_COMM_NULL) PetscCallMPI(MPI_Comm_free(&amgx->comm));
   } else {
-    PetscCallAmgX(AMGX_config_destroy(amgx->cfg));
+    if (amgx->cfg) {
+      PetscCallAmgX(AMGX_config_destroy(amgx->cfg));
+      amgx->cfg = nullptr;
+    }
   }
   s_count -= 1;
   PetscCall(PetscFree(amgx));
