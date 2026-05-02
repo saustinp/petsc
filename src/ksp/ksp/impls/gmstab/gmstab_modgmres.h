@@ -90,8 +90,18 @@ typedef struct {
   /* Stored Givens rotations, m of them. */
   PetscGivens2x1 *G;
 
-  /* Length-N scratch (for matvec output before column copy if needed). */
+  /* Length-N scratch buffers. work_n is the inner PCApply scratch passed
+     to KSP_PCApplyBAorAB; work_in / work_out are used for the
+     copy-in / copy-out around the matvec because PETSc MatDense only
+     allows one outstanding column-vec borrow at a time. */
   Vec work_n;
+  Vec work_in;
+  Vec work_out;
+
+  /* Pointer to the outer driver's matvec counter. Incremented once per
+     KSP_PCApplyBAorAB call (matching the C++ port's PerfMeasure::matvec
+     which bumps nummatvecs). NULL means counting disabled. */
+  PetscInt *matvec_count_ptr;
 } KSPGMSTABInnerWorkspace;
 
 /* Allocate / free the inner workspace. Caller passes m_max = max Arnoldi

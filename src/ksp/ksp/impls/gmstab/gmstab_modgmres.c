@@ -90,6 +90,8 @@ PETSC_INTERN PetscErrorCode KSPGMSTABInnerWorkspaceCreate_Private(KSP ksp, Petsc
   PetscCall(PetscCalloc1((size_t)m_max, &ws->G));
 
   PetscCall(VecDuplicate(template_vec, &ws->work_n));
+  PetscCall(VecDuplicate(template_vec, &ws->work_in));
+  PetscCall(VecDuplicate(template_vec, &ws->work_out));
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
@@ -105,6 +107,8 @@ PETSC_INTERN PetscErrorCode KSPGMSTABInnerWorkspaceDestroy_Private(KSPGMSTABInne
   PetscCall(PetscFree(ws->gamma));
   PetscCall(PetscFree(ws->G));
   PetscCall(VecDestroy(&ws->work_n));
+  PetscCall(VecDestroy(&ws->work_in));
+  PetscCall(VecDestroy(&ws->work_out));
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
@@ -319,24 +323,38 @@ static PetscErrorCode KSPGMSTABArnoldiStep_Private(KSPGMSTABInnerWorkspace *ws, 
   PetscFunctionBegin;
   Mat W = ws->W;
   const PetscInt ldH = ws->m + 1;
-  Vec wip1;
-  PetscCall(MatDenseGetColumnVec(W, i + 1, &wip1));
+
+  /* Copy W[:, i+1] into work_out to operate on without holding a column-vec
+     borrow (which would conflict with reading W[:, j] columns below). */
+  {
+    Vec wip1;
+    PetscCall(MatDenseGetColumnVec(W, i + 1, &wip1));
+    PetscCall(VecCopy(wip1, ws->work_out));
+    PetscCall(MatDenseRestoreColumnVec(W, i + 1, &wip1));
+  }
 
   for (PetscInt j = 0; j <= i; ++j) {
     Vec wj;
     PetscScalar hji;
     PetscCall(MatDenseGetColumnVecRead(W, j, &wj));
-    PetscCall(VecDot(wip1, wj, &hji));   /* dot(W[:, j], W[:, i+1]) — order matches Eigen */
-    PetscCall(VecAXPY(wip1, -hji, wj));
+    PetscCall(VecDot(ws->work_out, wj, &hji));
+    PetscCall(VecAXPY(ws->work_out, -hji, wj));
     PetscCall(MatDenseRestoreColumnVecRead(W, j, &wj));
     ws->H[(size_t)j + (size_t)i * (size_t)ldH] = hji;
   }
 
   PetscReal nrm;
-  PetscCall(VecNorm(wip1, NORM_2, &nrm));
+  PetscCall(VecNorm(ws->work_out, NORM_2, &nrm));
   ws->H[(size_t)(i + 1) + (size_t)i * (size_t)ldH] = (PetscScalar)nrm;
-  PetscCall(VecScale(wip1, 1.0 / nrm));
-  PetscCall(MatDenseRestoreColumnVec(W, i + 1, &wip1));
+  PetscCall(VecScale(ws->work_out, 1.0 / nrm));
+
+  /* Write the orthonormalised vector back into W[:, i+1]. */
+  {
+    Vec wip1;
+    PetscCall(MatDenseGetColumnVec(W, i + 1, &wip1));
+    PetscCall(VecCopy(ws->work_out, wip1));
+    PetscCall(MatDenseRestoreColumnVec(W, i + 1, &wip1));
+  }
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
@@ -385,13 +403,25 @@ PETSC_INTERN PetscErrorCode KSPGMSTABGmresM_Private(KSP ksp,
 
   for (PetscInt i = 0; i < m; ++i) {
     /* W[:, i+1] = A * W[:, i]
-       Through KSP_PCApplyBAorAB so pc_side dispatch is uniform. */
-    Vec wi, wip1;
-    PetscCall(MatDenseGetColumnVecRead(ws->W, i, &wi));
-    PetscCall(MatDenseGetColumnVec(ws->W, i + 1, &wip1));
-    PetscCall(KSP_PCApplyBAorAB(ksp, wi, wip1, ws->work_n));
-    PetscCall(MatDenseRestoreColumnVecRead(ws->W, i, &wi));
-    PetscCall(MatDenseRestoreColumnVec(ws->W, i + 1, &wip1));
+       Through KSP_PCApplyBAorAB so pc_side dispatch is uniform.
+       PETSc MatDense only allows ONE outstanding column-vec at a time, so
+       we copy W[:, i] into work_in, do the matvec into work_out (via
+       KSP_PCApplyBAorAB which uses work_n internally for any PCApply),
+       then copy work_out into W[:, i+1]. */
+    {
+      Vec wi;
+      PetscCall(MatDenseGetColumnVecRead(ws->W, i, &wi));
+      PetscCall(VecCopy(wi, ws->work_in));
+      PetscCall(MatDenseRestoreColumnVecRead(ws->W, i, &wi));
+    }
+    PetscCall(KSP_PCApplyBAorAB(ksp, ws->work_in, ws->work_out, ws->work_n));
+    if (ws->matvec_count_ptr) (*ws->matvec_count_ptr)++;
+    {
+      Vec wip1;
+      PetscCall(MatDenseGetColumnVec(ws->W, i + 1, &wip1));
+      PetscCall(VecCopy(ws->work_out, wip1));
+      PetscCall(MatDenseRestoreColumnVec(ws->W, i + 1, &wip1));
+    }
 
     /* Classical Gram-Schmidt + scaling. */
     PetscCall(KSPGMSTABArnoldiStep_Private(ws, i));
@@ -692,27 +722,37 @@ PETSC_INTERN PetscErrorCode KSPGMSTABAugGmresM_Private(KSP ksp,
   PetscCall(PetscMalloc1(s, &xi));
 
   for (PetscInt i = 0; i < m; ++i) {
-    /* W[:, i+1] = A * W[:, i] */
-    Vec wi, wip1;
-    PetscCall(MatDenseGetColumnVecRead(ws->W, i, &wi));
-    PetscCall(MatDenseGetColumnVec(ws->W, i + 1, &wip1));
-    PetscCall(KSP_PCApplyBAorAB(ksp, wi, wip1, ws->work_n));
-    PetscCall(MatDenseRestoreColumnVecRead(ws->W, i, &wi));
+    /* W[:, i+1] = A * W[:, i] (via work_in/work_out scratch) */
+    {
+      Vec wi;
+      PetscCall(MatDenseGetColumnVecRead(ws->W, i, &wi));
+      PetscCall(VecCopy(wi, ws->work_in));
+      PetscCall(MatDenseRestoreColumnVecRead(ws->W, i, &wi));
+    }
+    PetscCall(KSP_PCApplyBAorAB(ksp, ws->work_in, ws->work_out, ws->work_n));
+    if (ws->matvec_count_ptr) (*ws->matvec_count_ptr)++;
+    /* work_out now holds A*W[:,i]; project it before writing into W[:,i+1]. */
 
-    /* Y[:, i] = P^T * W[:, i+1] */
-    PetscCall(KSPGMSTABProjectColumn_Private(P, wip1, ws->Y, s, i, NULL));
+    /* Y[:, i] = P^T * work_out */
+    PetscCall(KSPGMSTABProjectColumn_Private(P, ws->work_out, ws->Y, s, i, NULL));
 
     /* xi = Z \ Y[:, i] */
     PetscCall(KSPGMSTABTriLSolve_Private(Z, Z_ldim, &ws->Y[(size_t)i * (size_t)s], xi, s));
 
-    /* W[:, i+1] -= V1 * xi */
+    /* work_out -= V1 * xi */
     for (PetscInt k = 0; k < s; ++k) {
       Vec V1k;
       PetscCall(MatDenseGetColumnVecRead(V1, k, &V1k));
-      PetscCall(VecAXPY(wip1, -xi[k], V1k));
+      PetscCall(VecAXPY(ws->work_out, -xi[k], V1k));
       PetscCall(MatDenseRestoreColumnVecRead(V1, k, &V1k));
     }
-    PetscCall(MatDenseRestoreColumnVec(ws->W, i + 1, &wip1));
+    /* Now copy into W[:, i+1]. */
+    {
+      Vec wip1;
+      PetscCall(MatDenseGetColumnVec(ws->W, i + 1, &wip1));
+      PetscCall(VecCopy(ws->work_out, wip1));
+      PetscCall(MatDenseRestoreColumnVec(ws->W, i + 1, &wip1));
+    }
 
     /* Classical GS + Givens. */
     PetscCall(KSPGMSTABArnoldiStep_Private(ws, i));

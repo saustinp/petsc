@@ -26,6 +26,7 @@
 
 #include <petsc/private/kspimpl.h>
 #include <../src/ksp/ksp/impls/gmstab/gmstabimpl.h>
+#include <../src/ksp/ksp/impls/gmstab/gmstab_internal.h>
 #include <petscblaslapack.h>
 #include <math.h>
 
@@ -35,19 +36,151 @@
 #define KSPGMSTAB_DEFAULT_STAB_ANGLE ((PetscReal)(M_PI * 7.0 / 36.0))
 
 /* ============================================================================
- * KSPSolve — Phase 1 stub
+ * KSPSolve_GMSTAB — driver. Port of Solver_GMsStab.m / solver.cpp::solve.
+ *
+ *   Mirrors the C++ port's outer driver:
+ *
+ *     1. Build / load shadow space P (one of three sources, validated in SetUp).
+ *     2. Open trace CSV if requested; emit the initial (matvec=0, x=0, ||b||) row.
+ *     3. Resume timer.
+ *     4. b_local = b - A * xGlobal             [first counted matvec]
+ *     5. r = b_local;  x_local = 0;  beta = ||r||;  betaLocal = beta.
+ *     6. Initialisation(...).
+ *     7. Snapshot.
+ *     8. while beta > tolabs:
+ *          decide t_restart, t_replace, L per the flying-restart heuristic
+ *          if L == 1: gmstab1(...);    n2cycles = 0
+ *          else:      gmstab2(...);    n2cycles += 1
+ *          if (recycling enabled): hU = V0; recycling_index = snapshot_count
+ *          if t_restart || t_replace: r = b_local - A*x; project; dir_rbio
+ *          if t_restart: bLocal=r; xGlobal+=x; x=0; betaLocal=beta
+ *          snapshot
+ *          if KSPMonitor convergence -> break
+ *
+ * NOTE — Phase 3 status:
+ *   Initialisation is implemented (gmstab_init.c).
+ *   gmstab1 / gmstab2 cycle bodies are NOT yet implemented (Phase 3b).
+ *   For the moment, if Initialisation does not converge (i.e. beta > tolabs
+ *   after init), the driver returns KSP_DIVERGED_BREAKDOWN with a PetscInfo
+ *   note. This lets us validate Initialisation in isolation while we
+ *   continue with the cycle bodies in subsequent commits.
  * ============================================================================ */
 static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
 {
+  KSP_GMSTAB *gms = (KSP_GMSTAB *)ksp->data;
   PetscFunctionBegin;
-  /* Phase 1: this is the registration smoke test. The algorithm is wired
-     in across Phase 2-4. We set a clear breakdown reason rather than
-     SETERRQ so the destructor + overall KSP machinery still gets exercised. */
+
+  /* Reset per-solve counters and state. */
+  gms->snapshot_count = 0;
+  gms->matvec_count   = 0;
+  gms->t_total        = 0.0;
+  gms->t_mv           = 0.0;
+  gms->cycle_count    = 0;
+  gms->n2cycles       = 0;
+  ksp->its            = 0;
+
+  /* Shadow space: precedence  P_user > P_file > default RNG. */
+  if (gms->P_user) {
+    PetscCall(MatDestroy(&gms->P));
+    PetscCall(PetscObjectReference((PetscObject)gms->P_user));
+    gms->P = gms->P_user;
+  } else if (gms->P_file[0]) {
+    PetscCall(KSPGMSTABLoadShadowFile_Private(ksp, gms));
+  } else {
+    PetscCall(KSPGMSTABBuildDefaultShadow_Private(ksp, gms));
+  }
+  PetscCheck(gms->P, PetscObjectComm((PetscObject)ksp), PETSC_ERR_PLIB,
+             "KSPGMSTAB: shadow space P was not built");
+
+  /* Open trace CSV if requested. The C++ port writes the first snapshot
+     in PerfMeasure's constructor (matvec=0, iterres=||b||, trueres=||b||,
+     runtime=0); reproduce that exactly. */
+  if (gms->trace_csv && !gms->trace_fp) {
+    gms->trace_fp = fopen(gms->trace_csv_path, "w");
+    PetscCheck(gms->trace_fp, PetscObjectComm((PetscObject)ksp), PETSC_ERR_FILE_OPEN,
+               "Cannot open trace_csv: %s", gms->trace_csv_path);
+    fprintf(gms->trace_fp, "iter,matvec,iterres,trueres,runtime,runtime_mv\n");
+  }
+
+  /* Set up the initial state.
+     C++ does:
+       perf init (writes initial snapshot at x=0, ||b||)
+       resume()
+       bLocal = b - A * xGlobal      [counted]
+       r = bLocal;  x_local = 0; beta = ||r||
+  */
+  Vec b, x_local;
+  PetscCall(KSPGetRhs(ksp, &b));
+  x_local = ksp->vec_sol;
+
+  PetscCall(VecDuplicate(b, &gms->b_local));
+  PetscCall(VecDuplicate(b, &gms->x_global));
+  PetscCall(VecDuplicate(b, &gms->r));
+
+  /* xGlobal := initial guess (which is x_local on entry; if user provided
+     KSPSetInitialGuessNonzero this is non-zero). */
+  PetscCall(VecCopy(x_local, gms->x_global));
+
+  /* Initial snapshot (matvec=0, x=0, iterres=||b||, trueres=||b||).
+     The C++ port's PerfMeasure constructor calls read(0, ||b||) before
+     any matvec. With xGlobal as the initial guess, the trueres at this
+     point is ||b - A*xGlobal||. The C++ port treats the very first
+     snapshot specially: it computes ||b||, NOT ||b - A*x0||, even when
+     x0 != 0. So we mirror that. */
+  PetscReal nb;
+  PetscCall(VecNorm(b, NORM_2, &nb));
+  if (gms->trace_csv && gms->trace_fp) {
+    fprintf(gms->trace_fp, "%d,%d,%.16e,%.16e,%.6e,%.6e\n",
+            0, 0, (double)nb, (double)nb, 0.0, 0.0);
+  }
+  gms->snapshot_count = 1;
+
+  /* Allocate inner GMRES workspace sized for the largest cycle (m_max = 2s+2). */
+  KSPGMSTABInnerWorkspace ws;
+  PetscCall(KSPGMSTABInnerWorkspaceCreate_Private(ksp, gms->s, 2 * gms->s + 2, b, &ws));
+  ws.matvec_count_ptr = &gms->matvec_count;
+
+  /* bLocal = b - A * xGlobal (counted matvec). */
+  Mat Amat;
+  PetscCall(KSPGetOperators(ksp, &Amat, NULL));
+  Vec Ax;
+  PetscCall(VecDuplicate(b, &Ax));
+  PetscCall(KSP_PCApplyBAorAB(ksp, gms->x_global, Ax, ws.work_n));   /* counted */
+  gms->matvec_count++;
+  PetscCall(VecWAXPY(gms->b_local, -1.0, Ax, b));
+  PetscCall(VecDestroy(&Ax));
+
+  PetscCall(VecCopy(gms->b_local, gms->r));
+  PetscCall(VecSet(x_local, 0.0));
+  PetscCall(VecNorm(gms->r, NORM_2, &gms->beta));
+  gms->beta_local = gms->beta;
+  gms->beta_max   = gms->beta;
+  PetscReal beta_curr = gms->beta;
+
+  /* Initialisation (cold start). */
+  PetscCall(KSPGMSTABInitialisation_Private(ksp, gms, &ws, x_local, gms->r, &beta_curr));
+  gms->beta = beta_curr;
+
+  if (ksp->reason) {
+    /* Convergence test inside Initialisation triggered. */
+    PetscCall(KSPGMSTABInnerWorkspaceDestroy_Private(&ws));
+    PetscFunctionReturn(PETSC_SUCCESS);
+  }
+
+  if (gms->beta <= ksp->abstol) {
+    ksp->reason = KSP_CONVERGED_ATOL;
+    PetscCall(KSPGMSTABInnerWorkspaceDestroy_Private(&ws));
+    PetscFunctionReturn(PETSC_SUCCESS);
+  }
+
+  /* Phase 3a checkpoint: cycle bodies not yet implemented. */
   ksp->reason = KSP_DIVERGED_BREAKDOWN;
   PetscCall(PetscInfo(ksp,
-    "KSPSolve_GMSTAB: phase-1 skeleton (algorithm not yet implemented). "
-    "See src/ksp/ksp/impls/gmstab/IMPLEMENTATION_PLAN.md for the phased "
-    "implementation timeline.\n"));
+    "KSPSolve_GMSTAB phase-3a: Initialisation completed with beta=%.6e "
+    "but cycle bodies (gmstab1/gmstab2) are not yet implemented. "
+    "See PHASE3_STATUS.md for the remaining work.\n", (double)gms->beta));
+
+  PetscCall(KSPGMSTABInnerWorkspaceDestroy_Private(&ws));
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
