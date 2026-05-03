@@ -71,13 +71,14 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
   PetscFunctionBegin;
 
   /* Reset per-solve counters and state. */
-  gms->snapshot_count = 0;
-  gms->matvec_count   = 0;
-  gms->t_total        = 0.0;
-  gms->t_mv           = 0.0;
-  gms->cycle_count    = 0;
-  gms->n2cycles       = 0;
-  ksp->its            = 0;
+  gms->snapshot_count             = 0;
+  gms->matvec_count               = 0;
+  gms->_last_logged_matvec_count  = 0;
+  gms->t_total                    = 0.0;
+  gms->t_mv                       = 0.0;
+  gms->cycle_count                = 0;
+  gms->n2cycles                   = 0;
+  ksp->its                        = 0;
 
   /* Shadow space: precedence  P_user > P_file > default RNG. */
   if (gms->P_user) {
@@ -121,19 +122,26 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
      KSPSetInitialGuessNonzero this is non-zero). */
   PetscCall(VecCopy(x_local, gms->x_global));
 
-  /* Initial snapshot (matvec=0, x=0, iterres=||b||, trueres=||b||).
-     The C++ port's PerfMeasure constructor calls read(0, ||b||) before
-     any matvec. With xGlobal as the initial guess, the trueres at this
-     point is ||b - A*xGlobal||. The C++ port treats the very first
-     snapshot specially: it computes ||b||, NOT ||b - A*x0||, even when
-     x0 != 0. So we mirror that. */
-  PetscReal nb;
-  PetscCall(VecNorm(b, NORM_2, &nb));
-  if (gms->trace_csv && gms->trace_fp) {
-    fprintf(gms->trace_fp, "%d,%d,%.16e,%.16e,%.6e,%.6e\n",
-            0, 0, (double)nb, (double)nb, 0.0, 0.0);
+  /* Constructor snapshot — matches the C++ port's PerfMeasure constructor:
+     iter=0, matvec=0, iterres=||b||, trueres=||b||, runtime=0.
+
+     Routed through Snapshot_Private so KSPConvergedDefault is called with
+     n=0 and properly initializes ksp->rnorm0 (otherwise rnorm0 stays 0
+     and every subsequent residual triggers a spurious DIVERGED_DTOL).
+     With x_global=initial guess and x_local=0 here, x_total=x_global, so
+     Snapshot_Private will compute trueres = ||b - A*x_global||. For zero
+     initial guess (the bit-equivalence harness), this equals ||b||
+     exactly. */
+  {
+    PetscReal nb;
+    PetscCall(VecNorm(b, NORM_2, &nb));
+    PetscCall(KSPGMSTABSnapshot_Private(ksp, gms, gms->x_global, nb));
   }
-  gms->snapshot_count = 1;
+
+  /* If KSPConvergedDefault flagged convergence on the constructor row
+     (e.g. ||b|| ~ 0 or already below abstol), respect that immediately —
+     ws hasn't been allocated yet, so no inner-workspace cleanup needed. */
+  if (ksp->reason && ksp->reason != KSP_CONVERGED_ITERATING) PetscFunctionReturn(PETSC_SUCCESS);
 
   /* Allocate inner GMRES workspace sized for the largest cycle (m_max = 2s+2). */
   KSPGMSTABInnerWorkspace ws;
@@ -173,12 +181,47 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
     PetscFunctionReturn(PETSC_SUCCESS);
   }
 
-  /* Phase 3a checkpoint: cycle bodies not yet implemented. */
+  /* Phase 3b validation path: -ksp_gmstab_force_l1_only runs exactly one
+     Cycle1 invocation, then exits. Lets ex_gmstab_cycle1 diff the cycle's
+     output against the C++ oracle without the flying-restart driver in
+     the way. */
+  if (gms->force_l1_only) {
+    /* Begin-of-cycle snapshot — matches the C++ main solver loop's
+       perf.read at solver.cpp:541-543 (the duplicate of Init's final
+       perf.read). mv and beta are unchanged from Init's last snapshot
+       since no work has happened in between, so this snapshot has the
+       same payload as the previous one. */
+    PetscCall(KSPGMSTABSnapshot_Private(ksp, gms, x_local, beta_curr));
+
+    PetscCall(KSPGMSTABCycle1_Private(ksp, gms, &ws, x_local, gms->r, &beta_curr));
+    gms->beta = beta_curr;
+    gms->cycle_count++;
+
+    /* Post-cycle snapshot — matches the C++ main solver loop's perf.read
+       at solver.cpp:599-602, paired with the cycle's own final read. */
+    PetscCall(KSPGMSTABSnapshot_Private(ksp, gms, x_local, beta_curr));
+
+    if (gms->beta <= ksp->abstol) {
+      ksp->reason = KSP_CONVERGED_ATOL;
+    } else if (!ksp->reason) {
+      /* Single-cycle validation: nothing more to do, even if beta > tolabs. */
+      ksp->reason = KSP_DIVERGED_BREAKDOWN;
+      PetscCall(PetscInfo(ksp,
+        "KSPSolve_GMSTAB force_l1_only: ran one Cycle1, beta=%.6e > tolabs=%.6e\n",
+        (double)gms->beta, (double)ksp->abstol));
+    }
+    PetscCall(KSPGMSTABInnerWorkspaceDestroy_Private(&ws));
+    PetscFunctionReturn(PETSC_SUCCESS);
+  }
+
+  /* Phase 3a checkpoint: cycle bodies not yet wired into the production
+     driver loop (cycle2 + flying restart still pending). */
   ksp->reason = KSP_DIVERGED_BREAKDOWN;
   PetscCall(PetscInfo(ksp,
     "KSPSolve_GMSTAB phase-3a: Initialisation completed with beta=%.6e "
-    "but cycle bodies (gmstab1/gmstab2) are not yet implemented. "
-    "See PHASE3_STATUS.md for the remaining work.\n", (double)gms->beta));
+    "but cycle bodies (gmstab1/gmstab2) are not yet wired into the "
+    "production driver. See PHASE3_STATUS.md for the remaining work.\n",
+    (double)gms->beta));
 
   PetscCall(KSPGMSTABInnerWorkspaceDestroy_Private(&ws));
   PetscFunctionReturn(PETSC_SUCCESS);
@@ -540,6 +583,17 @@ static PetscErrorCode KSPSetFromOptions_GMSTAB(KSP ksp, PetscOptionItems PetscOp
             NULL, gms->n2cycles_max, &this_int, &flg));
   if (flg) gms->n2cycles_max = this_int;
 
+  /* Phase 3b validation knob — runs exactly one Cycle1 after Initialisation
+     and exits, so the cycle's algebra can be diff'd against the C++ oracle
+     in isolation from the driver loop. Off in production. */
+  {
+    PetscBool this_bool;
+    PetscCall(PetscOptionsBool("-ksp_gmstab_force_l1_only",
+              "validation: run exactly ONE Cycle1 after Initialisation, then exit BREAKDOWN",
+              NULL, gms->force_l1_only, &this_bool, &flg));
+    if (flg) gms->force_l1_only = this_bool;
+  }
+
   /* Recycling — Phase 8 only. Knob is exposed but warning issued if used. */
   PetscCall(PetscOptionsReal("-ksp_gmstab_tolabs2",
             "recycling-dump threshold (Phase 8 only; ignored at present)",
@@ -642,6 +696,7 @@ PETSC_EXTERN PetscErrorCode KSPCreate_GMSTAB(KSP ksp)
   gms->c_restart     = (PetscReal)1e-2;
   gms->c_replace     = (PetscReal)1e-2;
   gms->n2cycles_max  = 3;
+  gms->force_l1_only = PETSC_FALSE;
   gms->stab_angle    = KSPGMSTAB_DEFAULT_STAB_ANGLE;
   gms->tolabs2       = PETSC_INFINITY;
   gms->has_recycling = PETSC_FALSE;

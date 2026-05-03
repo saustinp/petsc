@@ -23,26 +23,58 @@ PETSC_INTERN PetscErrorCode KSPGMSTABSnapshot_Private(KSP ksp, KSP_GMSTAB *gms,
                                                        Vec x_total, PetscReal iter_norm)
 {
   PetscFunctionBegin;
-  Vec b, Ax, r_true;
+
+  /* Invariants — cheap defensive checks. matvec_count and snapshot_count
+     are unsigned-semantically monotonic; assert that here so future bugs
+     that decrement them (or skip the increment) trip a clear error rather
+     than emitting a corrupted CSV row. */
+  PetscCheck(gms->matvec_count   >= 0, PetscObjectComm((PetscObject)ksp), PETSC_ERR_PLIB,
+             "KSPGMSTABSnapshot_Private: matvec_count went negative (=%" PetscInt_FMT ")",
+             gms->matvec_count);
+  PetscCheck(gms->snapshot_count >= 0, PetscObjectComm((PetscObject)ksp), PETSC_ERR_PLIB,
+             "KSPGMSTABSnapshot_Private: snapshot_count went negative (=%" PetscInt_FMT ")",
+             gms->snapshot_count);
+  PetscCheck(gms->matvec_count   >= gms->_last_logged_matvec_count,
+             PetscObjectComm((PetscObject)ksp), PETSC_ERR_PLIB,
+             "KSPGMSTABSnapshot_Private: matvec_count went backwards (was %" PetscInt_FMT ", now %" PetscInt_FMT ") — "
+             "indicates a missing-counter or double-counted matvec bug",
+             gms->_last_logged_matvec_count, gms->matvec_count);
+  gms->_last_logged_matvec_count = gms->matvec_count;
+
   PetscReal norm_true = 0.0;
 
-  /* Compute the true residual for tracing / convergence. The "uncounted"
-     matvec semantics: we must not increment matvec_count for this. */
-  PetscCall(KSPGetRhs(ksp, &b));
-  PetscCall(VecDuplicate(b, &Ax));
-  PetscCall(VecDuplicate(b, &r_true));
-  Mat Amat;
-  PetscCall(KSPGetOperators(ksp, &Amat, NULL));
-  PetscCall(MatMult(Amat, x_total, Ax));
-  PetscCall(VecWAXPY(r_true, -1.0, Ax, b));
-  PetscCall(VecNorm(r_true, NORM_2, &norm_true));
-  PetscCall(VecDestroy(&Ax));
-  PetscCall(VecDestroy(&r_true));
+  /* The constructor snapshot (snapshot_count == 0) reports ||b|| as the
+     true residual unconditionally, matching the C++ port's PerfMeasure
+     constructor — it does NOT recompute ||b - A*x0|| even when the user
+     supplied a non-zero initial guess. We honour that by skipping the
+     uncounted MatMult on the very first call and using iter_norm
+     directly. (Caller must pass iter_norm = ||b|| at the constructor.)
 
-  /* Trace CSV row. */
+     For all later snapshots, we recompute ||b - A*x_total|| via an
+     uncounted MatMult so the "true" residual we log is independent of
+     accumulated FP error in the iterated residual. */
+  if (gms->snapshot_count == 0) {
+    norm_true = iter_norm;
+  } else {
+    Vec b, Ax, r_true;
+    PetscCall(KSPGetRhs(ksp, &b));
+    PetscCall(VecDuplicate(b, &Ax));
+    PetscCall(VecDuplicate(b, &r_true));
+    Mat Amat;
+    PetscCall(KSPGetOperators(ksp, &Amat, NULL));
+    PetscCall(MatMult(Amat, x_total, Ax));
+    PetscCall(VecWAXPY(r_true, -1.0, Ax, b));
+    PetscCall(VecNorm(r_true, NORM_2, &norm_true));
+    PetscCall(VecDestroy(&Ax));
+    PetscCall(VecDestroy(&r_true));
+  }
+
+  /* Trace CSV row. The iter column is the pre-increment count, so the
+     constructor snapshot lands at iter=0 (matching the C++ port). */
+  const PetscInt iter_idx = gms->snapshot_count;
   if (gms->trace_csv && gms->trace_fp) {
     fprintf(gms->trace_fp, "%" PetscInt_FMT ",%" PetscInt_FMT ",%.16e,%.16e,%.6e,%.6e\n",
-            gms->snapshot_count, gms->matvec_count,
+            iter_idx, gms->matvec_count,
             (double)iter_norm, (double)norm_true,
             (double)gms->t_total, (double)gms->t_mv);
     fflush(gms->trace_fp);
@@ -63,7 +95,11 @@ PETSC_INTERN PetscErrorCode KSPGMSTABSnapshot_Private(KSP ksp, KSP_GMSTAB *gms,
             "KSPGMSTAB: norm type %s not supported", KSPNormTypes[ksp->normtype]);
   }
   ksp->rnorm = rnorm_for_check;
-  ksp->its   = gms->snapshot_count;
+  /* Pass the pre-increment iteration index to KSPConvergedDefault so the
+     n==0 initialization branch fires on the constructor snapshot,
+     properly seeding ksp->rnorm0. Without this, every subsequent residual
+     would trigger DIVERGED_DTOL with rnorm0 == 0. */
+  ksp->its   = iter_idx;
   PetscCall(KSPLogResidualHistory(ksp, rnorm_for_check));
   PetscCall(KSPMonitor(ksp, ksp->its, rnorm_for_check));
   PetscCall((*ksp->converged)(ksp, ksp->its, rnorm_for_check, &ksp->reason, ksp->cnvP));

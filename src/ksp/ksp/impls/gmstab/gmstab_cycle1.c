@@ -43,6 +43,7 @@
 */
 #include <petsc/private/kspimpl.h>
 #include <../src/ksp/ksp/impls/gmstab/gmstab_internal.h>
+#include <../src/ksp/ksp/impls/gmstab/gmstab_dump.h>
 #include <math.h>
 
 /* Snapshot callback used by pgmres to fire mid-iteration snapshots. */
@@ -71,11 +72,22 @@ PETSC_INTERN PetscErrorCode KSPGMSTABCycle1_Private(KSP ksp, KSP_GMSTAB *gms,
   const PetscInt s = gms->s;
   PetscReal      beta = *beta_io;
 
+  /* ---- chk00: ENTRY ----------------------------------------------------*/
+  PetscCall(KSPGMSTABDumpMat_Private (0, "V0_in",   gms->V0));
+  PetscCall(KSPGMSTABDumpMat_Private (0, "V1_in",   gms->V1));
+  PetscCall(KSPGMSTABDumpDense_Private(0, "Z_in",   gms->Z, gms->Z_ldim, s, s));
+  PetscCall(KSPGMSTABDumpVec_Private (0, "x_in",   x_local));
+  PetscCall(KSPGMSTABDumpVec_Private (0, "r0_in",  r0));
+  PetscCall(KSPGMSTABDumpReal_Private(0, "beta_in", beta));
+
   /* (1) r1 = A * r0  [counted matvec], StabCoeffs on [r0, r1]. */
   Vec r1;
   PetscCall(VecDuplicate(r0, &r1));
   PetscCall(KSP_PCApplyBAorAB(ksp, r0, r1, ws->work_n));
   gms->matvec_count++;
+
+  /* ---- chk01: AFTER r1 = A * r0 ---------------------------------------*/
+  PetscCall(KSPGMSTABDumpVec_Private(1, "r1", r1));
 
   Vec stab_cols[2] = {r0, r1};
   PetscScalar tau_buf[1];
@@ -84,10 +96,18 @@ PETSC_INTERN PetscErrorCode KSPGMSTABCycle1_Private(KSP ksp, KSP_GMSTAB *gms,
   const PetscScalar tau = tau_buf[0];
   beta = beta_after_stab;
 
+  /* ---- chk02: AFTER StabCoeffs ----------------------------------------*/
+  PetscCall(KSPGMSTABDumpReal_Private(2, "tau",      (PetscReal)PetscRealPart(tau)));
+  PetscCall(KSPGMSTABDumpReal_Private(2, "beta_new", beta));
+
   /* x ← x + tau*r0 ; r0 ← r0 - tau*r1 */
   PetscCall(VecAXPY(x_local, tau, r0));
   PetscCall(VecAXPY(r0, -tau, r1));
   PetscCall(VecDestroy(&r1));
+
+  /* ---- chk03: AFTER applying tau --------------------------------------*/
+  PetscCall(KSPGMSTABDumpVec_Private(3, "x",  x_local));
+  PetscCall(KSPGMSTABDumpVec_Private(3, "r0", r0));
 
   if (beta < ksp->abstol) {
     PetscCall(KSPGMSTABSnapshot_Private(ksp, gms, x_local, beta));
@@ -103,7 +123,24 @@ PETSC_INTERN PetscErrorCode KSPGMSTABCycle1_Private(KSP ksp, KSP_GMSTAB *gms,
 
   /* (3) Block-Gram-Schmidt extension of V0 against [V1].
          C is 2s × 2s, lower-tri-blocks and identity layout per the
-         C++ port (line 142-156). */
+         C++ port (line 142-156).
+
+         Note on rank deficiency: V0 and V1 are both s-dim subspaces of
+         the same (s+1)-dim Krylov space (built by Initialisation), so
+         range(V0) ∩ range(V1) is at least (s−1)-dim. The BGS will
+         find that V0 columns 1..s-1 reduce to magnitude ~1e-16 after
+         orthogonalization (only column 0 captures the one fresh
+         direction). The MATLAB reference (GMstab1.m lines 14-29) and
+         the C++ port both unconditionally normalize each column
+         regardless of its post-orthogonalization norm — there is NO
+         rank-deficiency detection or skip path. We do the same. The
+         resulting noise-direction unit vectors are then absorbed by
+         the QfQz multiplication at step (6): the rows of QfQz that
+         pair with the noise V0 columns inherit machine-epsilon
+         magnitude from F's rank-deficient columns, so noise × ε
+         vanishes against the legitimate V1 contributions. See
+         PHASE3_STATUS.md "V0_postBGS rank-deficiency noise" for the
+         full lifecycle. */
   PetscScalar *C;
   const PetscInt twos = 2 * s;
   PetscCall(PetscCalloc1((size_t)twos * (size_t)twos, &C));
@@ -151,6 +188,10 @@ PETSC_INTERN PetscErrorCode KSPGMSTABCycle1_Private(KSP ksp, KSP_GMSTAB *gms,
     PetscCall(MatDenseRestoreColumnVec(gms->V0, i, &V0i));
   }
 
+  /* ---- chk04: AFTER block-GS extension --------------------------------*/
+  PetscCall(KSPGMSTABDumpMat_Private  (4, "V0_postBGS", gms->V0));
+  PetscCall(KSPGMSTABDumpDense_Private(4, "C", C, twos, twos, twos));
+
   /* (4) F = (1/tau) * C(:, s..2s-1) - C(:, 0..s-1)   (2s × s)
          [Q_f, R_f] = qr(F) — Q_f is 2s × s thin, R_f is s × s upper-tri. */
   PetscScalar *F;
@@ -160,6 +201,9 @@ PETSC_INTERN PetscErrorCode KSPGMSTABCycle1_Private(KSP ksp, KSP_GMSTAB *gms,
       F[(size_t)rr + (size_t)c_ * (size_t)twos] =
           (1.0 / tau) * C[(size_t)rr + (size_t)(s + c_) * (size_t)twos]
         -              C[(size_t)rr + (size_t)c_ * (size_t)twos];
+
+  /* ---- chk05: AFTER F construction ------------------------------------*/
+  PetscCall(KSPGMSTABDumpDense_Private(5, "F", F, twos, twos, s));
 
   /* QR(F): use dgeqrf+dorgqr to extract thin Q (2s × s) and R (s × s). */
   PetscScalar *Qf, *Rf;
@@ -205,6 +249,10 @@ PETSC_INTERN PetscErrorCode KSPGMSTABCycle1_Private(KSP ksp, KSP_GMSTAB *gms,
     PetscCall(PetscFree(Fbuf));
   }
 
+  /* ---- chk06: AFTER QR(F) ---------------------------------------------*/
+  PetscCall(KSPGMSTABDumpDense_Private(6, "Qf", Qf, twos, twos, s));
+  PetscCall(KSPGMSTABDumpDense_Private(6, "Rf", Rf, s,    s,    s));
+
   /* (5) ZbyRf := -Z / R_f.   We solve X * R_f = -Z  →  X = -Z * inv(R_f).
          Implemented as: solve R_f' * X' = -Z' (lower-tri), then transpose. */
   PetscScalar *ZbyRf;
@@ -220,6 +268,9 @@ PETSC_INTERN PetscErrorCode KSPGMSTABCycle1_Private(KSP ksp, KSP_GMSTAB *gms,
       ZbyRf[(size_t)rr + (size_t)c_ * (size_t)s] = -gms->Z[(size_t)rr + (size_t)c_ * (size_t)s];
   PetscCall(KSPGMSTABTrsm_Private("R", "U", "N", "N", s, s, 1.0, Rf, s, ZbyRf, s));
 
+  /* ---- chk07: AFTER ZbyRf trsm ----------------------------------------*/
+  PetscCall(KSPGMSTABDumpDense_Private(7, "ZbyRf", ZbyRf, s, s, s));
+
   /* [Q_z, L_z] := lq(ZbyRf). */
   PetscScalar *Qz, *Lz;
   PetscCall(PetscMalloc2((size_t)s * (size_t)s, &Qz, (size_t)s * (size_t)s, &Lz));
@@ -230,10 +281,17 @@ PETSC_INTERN PetscErrorCode KSPGMSTABCycle1_Private(KSP ksp, KSP_GMSTAB *gms,
     for (PetscInt rr = 0; rr < s; ++rr)
       gms->Z[(size_t)rr + (size_t)c_ * (size_t)s] = Lz[(size_t)rr + (size_t)c_ * (size_t)s];
 
+  /* ---- chk08: AFTER lq(ZbyRf) -----------------------------------------*/
+  PetscCall(KSPGMSTABDumpDense_Private(8, "Qz",       Qz,    s, s, s));
+  PetscCall(KSPGMSTABDumpDense_Private(8, "Z_postLq", Lz,    s, s, s));
+
   /* (6) V0 := [V1, V0] * (Q_f * Q_z).   QfQz is 2s × s. */
   PetscScalar *QfQz;
   PetscCall(PetscMalloc1((size_t)twos * (size_t)s, &QfQz));
   PetscCall(KSPGMSTABGemm_Private("N", "N", twos, s, s, 1.0, Qf, twos, Qz, s, 0.0, QfQz, twos));
+
+  /* ---- chk09: AFTER Qf * Qz product -----------------------------------*/
+  PetscCall(KSPGMSTABDumpDense_Private(9, "QfQz", QfQz, twos, twos, s));
 
   /* Build a temporary V_concat = [V1, V0] (N × 2s) by using two scratch
      vec accumulations per output column. We produce the new V0 column-
@@ -273,6 +331,9 @@ PETSC_INTERN PetscErrorCode KSPGMSTABCycle1_Private(KSP ksp, KSP_GMSTAB *gms,
   PetscCall(MatDestroy(&gms->V0));
   gms->V0 = V0_new;
 
+  /* ---- chk10: AFTER V0 := [V1, V0] * QfQz -----------------------------*/
+  PetscCall(KSPGMSTABDumpMat_Private(10, "V0_postUpdate", gms->V0));
+
   /* (7) pgmres_m for s steps. Reset workspace first. */
   ws->m = s;
   {
@@ -305,6 +366,49 @@ PETSC_INTERN PetscErrorCode KSPGMSTABCycle1_Private(KSP ksp, KSP_GMSTAB *gms,
   beta = beta_after_p;
   PetscCall(VecDestroy(&x_p));
   PetscCall(VecDestroy(&r_p));
+
+  /* ---- chk11: AFTER pgmres_m ------------------------------------------
+     We dump the workspace state AFTER pgmres returns: ws->W, ws->Y, ws->H,
+     plus the extracted Qh and Rh that the cycle uses below. Note Qh in
+     the C++ port is (s+1) × s = Q.topRows(m).transpose(); we extract from
+     ws->Q below (line by line in the post-update step), but for the dump
+     we materialize the same form here. */
+  {
+    const PetscInt mp1_dump = s + 1;
+    /* Y, H are stored in ws->Y / ws->H as column-major s × mp1, mp1 × s
+       respectively (with leading dim ldH = s for Y, mp1 for H). */
+    /* ws->W is allocated with m_max+1 = 2s+3 columns; cycle1 only fills
+       the first s+1. Dump just the active slice so it pairs cleanly with
+       the C++ port's (s+1)-column W. ws->W is a *distributed* MatDense,
+       so we must use the parallel-aware Mat dump, not the replicated
+       small-dense path (which would silently emit only rank 0's local
+       rows in parallel mode). */
+    PetscCall(KSPGMSTABDumpMatCols_Private(11, "W", ws->W, mp1_dump));
+    PetscCall(KSPGMSTABDumpDense_Private(11, "Y", ws->Y, s,        s,    mp1_dump));
+    PetscCall(KSPGMSTABDumpDense_Private(11, "H", ws->H, mp1_dump, mp1_dump, s));
+    /* Extract Qh same way as the post-update logic does, so we dump
+       *exactly* what the cycle code uses. */
+    PetscScalar *Qh_dump;
+    PetscCall(PetscMalloc1((size_t)mp1_dump * (size_t)s, &Qh_dump));
+    for (PetscInt b_ = 0; b_ < s; ++b_)
+      for (PetscInt a_ = 0; a_ < mp1_dump; ++a_)
+        Qh_dump[(size_t)a_ + (size_t)b_ * (size_t)mp1_dump] =
+            ws->Q[(size_t)b_ + (size_t)a_ * (size_t)mp1_dump];
+    PetscCall(KSPGMSTABDumpDense_Private(11, "Qh", Qh_dump, mp1_dump, mp1_dump, s));
+    PetscCall(PetscFree(Qh_dump));
+    /* Rh is the upper triangle of ws->R(0:s, 0:s) (column-major, ldR = mp1). */
+    PetscScalar *Rh_dump;
+    PetscCall(PetscCalloc1((size_t)s * (size_t)s, &Rh_dump));
+    for (PetscInt b_ = 0; b_ < s; ++b_)
+      for (PetscInt a_ = 0; a_ <= b_; ++a_)
+        Rh_dump[(size_t)a_ + (size_t)b_ * (size_t)s] =
+            ws->R[(size_t)a_ + (size_t)b_ * (size_t)mp1_dump];
+    PetscCall(KSPGMSTABDumpDense_Private(11, "Rh", Rh_dump, s, s, s));
+    PetscCall(PetscFree(Rh_dump));
+    PetscCall(KSPGMSTABDumpVec_Private (11, "x_postP", x_local));
+    PetscCall(KSPGMSTABDumpVec_Private (11, "r_postP", r0));
+    PetscCall(KSPGMSTABDumpReal_Private(11, "beta_postP", beta));
+  }
 
   /* (8) Convergence check / termination. */
   PetscCall(KSPGMSTABSnapshot_Private(ksp, gms, x_local, beta));
@@ -346,9 +450,16 @@ PETSC_INTERN PetscErrorCode KSPGMSTABCycle1_Private(KSP ksp, KSP_GMSTAB *gms,
   PetscCall(PetscMalloc1((size_t)s * (size_t)s, &YQh));
   PetscCall(KSPGMSTABGemm_Private("N", "N", s, s, mp1, 1.0, ws->Y, s, Qh, mp1, 0.0, YQh, s));
 
+  /* ---- chk12: Y * Qh --------------------------------------------------*/
+  PetscCall(KSPGMSTABDumpDense_Private(12, "YQh", YQh, s, s, s));
+
   PetscScalar *Qz2, *Lz2;
   PetscCall(PetscMalloc2((size_t)s * (size_t)s, &Qz2, (size_t)s * (size_t)s, &Lz2));
   PetscCall(KSPGMSTABLq_Private(YQh, s, s, s, Qz2, s, Lz2, s));
+
+  /* ---- chk13: AFTER lq(Y*Qh) ------------------------------------------*/
+  PetscCall(KSPGMSTABDumpDense_Private(13, "Qz2", Qz2, s, s, s));
+  PetscCall(KSPGMSTABDumpDense_Private(13, "Lz2", Lz2, s, s, s));
 
   /* xi = Rh \ (Qz2 * (Lz2 \ eta)). */
   PetscScalar *inner, *xi, *temp;
@@ -358,6 +469,11 @@ PETSC_INTERN PetscErrorCode KSPGMSTABCycle1_Private(KSP ksp, KSP_GMSTAB *gms,
   PetscCall(KSPGMSTABGemv_Private("N", s, s, 1.0, Qz2, s, inner, 1, 0.0, temp, 1));
   for (PetscInt k = 0; k < s; ++k) xi[k] = temp[k];
   PetscCall(KSPGMSTABTrsv_Private("U", "N", "N", s, Rh, s, xi, 1));
+
+  /* ---- chk14: AFTER xi ------------------------------------------------*/
+  PetscCall(KSPGMSTABDumpVector1d_Private(14, "eta",   eta,   s));
+  PetscCall(KSPGMSTABDumpVector1d_Private(14, "inner", inner, s));
+  PetscCall(KSPGMSTABDumpVector1d_Private(14, "xi",    xi,    s));
 
   /* (10) x += W(:, 0..s-1) * xi - V0 * (Z \ (Y(:, 0..s-1) * xi)). */
   for (PetscInt k = 0; k < s; ++k) {
@@ -379,6 +495,9 @@ PETSC_INTERN PetscErrorCode KSPGMSTABCycle1_Private(KSP ksp, KSP_GMSTAB *gms,
     PetscCall(MatDenseRestoreColumnVecRead(gms->V0, k, &V0k));
   }
 
+  /* ---- chk15: AFTER x update ------------------------------------------*/
+  PetscCall(KSPGMSTABDumpVec_Private(15, "x", x_local));
+
   /* c0 = gamma_vec - H * xi;    beta = ||c0||. */
   PetscScalar *c0;
   PetscCall(PetscMalloc1(mp1, &c0));
@@ -390,6 +509,10 @@ PETSC_INTERN PetscErrorCode KSPGMSTABCycle1_Private(KSP ksp, KSP_GMSTAB *gms,
     for (PetscInt k = 0; k < mp1; ++k) cn += PetscRealPart(c0[k]) * PetscRealPart(c0[k]);
     beta = PetscSqrtReal(cn);
   }
+
+  /* ---- chk16: AFTER c0 / beta -----------------------------------------*/
+  PetscCall(KSPGMSTABDumpVector1d_Private(16, "c0", c0, mp1));
+  PetscCall(KSPGMSTABDumpReal_Private    (16, "beta_final", beta));
 
   /* V0 := W(:, 0..s-1) * (Rh \ Qz2) - V0 * (Z \ (Y(:, 0..s-1) * (Rh \ Qz2))). */
   PetscScalar *RhQz2;
@@ -479,6 +602,12 @@ PETSC_INTERN PetscErrorCode KSPGMSTABCycle1_Private(KSP ksp, KSP_GMSTAB *gms,
   for (PetscInt c_ = 0; c_ < s; ++c_)
     for (PetscInt rr = 0; rr < s; ++rr)
       gms->Z[(size_t)rr + (size_t)c_ * (size_t)s] = Lz2[(size_t)rr + (size_t)c_ * (size_t)s];
+
+  /* ---- chk17: AFTER post-update (V0, V1, r0, Z) -----------------------*/
+  PetscCall(KSPGMSTABDumpMat_Private  (17, "V0_final", gms->V0));
+  PetscCall(KSPGMSTABDumpMat_Private  (17, "V1_final", gms->V1));
+  PetscCall(KSPGMSTABDumpVec_Private  (17, "r0_final", r0));
+  PetscCall(KSPGMSTABDumpDense_Private(17, "Z_final",  gms->Z, gms->Z_ldim, s, s));
 
   *beta_io = beta;
 

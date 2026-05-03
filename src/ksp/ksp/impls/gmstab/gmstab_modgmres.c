@@ -593,6 +593,7 @@ PETSC_INTERN PetscErrorCode KSPGMSTABPGmresM_Private(KSP ksp,
     Vec wip1;
     PetscCall(MatDenseGetColumnVec(ws->W, i + 1, &wip1));
     PetscCall(KSP_PCApplyBAorAB(ksp, proj_v, wip1, ws->work_n));
+    if (ws->matvec_count_ptr) (*ws->matvec_count_ptr)++;
     PetscCall(MatDenseRestoreColumnVec(ws->W, i + 1, &wip1));
 
     /* Classical GS + Givens. */

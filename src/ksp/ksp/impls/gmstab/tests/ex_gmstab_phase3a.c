@@ -173,6 +173,7 @@ int main(int argc, char **argv)
   int rows_compared = 0;
   int matvec_match  = 1;
   double max_iter_drift = 0.0, max_true_drift = 0.0;
+  int constructor_strict_pass = 1;
   for (int row = 0; row < 2 && fgets(buf_o, sizeof(buf_o), ours) && fgets(buf_r, sizeof(buf_r), ref); ++row) {
     int io, mo;
     double iro, tro, ru_o, rmv_o;
@@ -187,14 +188,40 @@ int main(int argc, char **argv)
     if (dr_true > max_true_drift) max_true_drift = dr_true;
     printf("[phase3a] row %d: ours=(matvec=%d, iter=%.6e, true=%.6e)  ref=(matvec=%d, iter=%.6e, true=%.6e)  drift=%.2e/%.2e\n",
            row, mo, iro, tro, mr, irr, trr, dr_iter, dr_true);
+
+    /* Strict constructor-row checks (tripwire — catches the regressions we
+       worked through in Phase 3b). The constructor row must satisfy:
+         iter == 0, matvec == 0
+         iterres == trueres (within machine epsilon — both should be ||b||)
+         iter and matvec runtimes both 0 (no work has happened yet)
+       These are enforced strictly because any drift here means a
+       non-trivial state change snuck into the constructor path. */
+    if (row == 0) {
+      if (io != 0 || mo != 0) {
+        printf("[phase3a]   STRICT FAIL: constructor row must have iter=0,mv=0 (got iter=%d,mv=%d)\n", io, mo);
+        constructor_strict_pass = 0;
+      }
+      if (fabs(iro - tro) > 1e-15) {
+        printf("[phase3a]   STRICT FAIL: constructor iterres != trueres (|diff|=%.3e)\n", fabs(iro - tro));
+        constructor_strict_pass = 0;
+      }
+      if (ru_o != 0.0 || rmv_o != 0.0) {
+        printf("[phase3a]   STRICT FAIL: constructor runtimes must be 0 (got %.3e/%.3e)\n", ru_o, rmv_o);
+        constructor_strict_pass = 0;
+      }
+    }
     rows_compared++;
   }
   fclose(ours);
   fclose(ref);
 
-  printf("[phase3a] rows_compared=%d matvec_match=%d max_iter_drift=%.3e max_true_drift=%.3e\n",
-         rows_compared, matvec_match, max_iter_drift, max_true_drift);
-  int pass = (matvec_match && max_iter_drift < 1e-10 && max_true_drift < 1e-10) ? 1 : 0;
+  printf("[phase3a] rows_compared=%d matvec_match=%d max_iter_drift=%.3e max_true_drift=%.3e constructor_strict=%d\n",
+         rows_compared, matvec_match, max_iter_drift, max_true_drift, constructor_strict_pass);
+  int pass = (matvec_match
+              && max_iter_drift < 1e-10
+              && max_true_drift < 1e-10
+              && constructor_strict_pass
+              && rows_compared == 2) ? 1 : 0;
   printf("[phase3a] %s\n", pass ? "[PASS]" : "[FAIL]");
 
   PetscCall(PetscFinalize());

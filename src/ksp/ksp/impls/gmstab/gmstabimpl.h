@@ -44,6 +44,13 @@ typedef struct {
                                    beta < c_replace * betaMax (default 1e-2) */
   PetscInt    n2cycles_max;     /* force a Cycle1 after n2cycles_max
                                    consecutive Cycle2s (default 3) */
+  PetscBool   force_l1_only;    /* validation knob (default PETSC_FALSE):
+                                   when set, the driver runs Initialisation
+                                   then exactly ONE Cycle1 and exits with
+                                   KSP_DIVERGED_BREAKDOWN unless tolabs is
+                                   reached. Used by ex_gmstab_cycle1 to
+                                   isolate cycle 1 from the flying-restart
+                                   driver (Phase 3b validation). */
 
   /* Recycling parameters (Phase 8 only — left at off / NULL until then) */
   PetscReal   tolabs2;          /* dump hU when iter-residual exceeds this;
@@ -120,6 +127,11 @@ typedef struct {
   FILE       *trace_fp;
   PetscInt    snapshot_count;
   PetscInt    matvec_count;     /* counted matvecs (mirrors PerfMeasure) */
+  PetscInt    _last_logged_matvec_count;  /* tripwire — last value matvec_count
+                                             held at the previous Snapshot_Private
+                                             call. Used to assert monotonicity
+                                             across snapshots; set to 0 on each
+                                             KSPSolve_GMSTAB entry. */
   PetscLogDouble t_total_start; /* wall-clock at last resume */
   PetscReal   t_total;          /* total runtime accumulated across pauses */
   PetscReal   t_mv;             /* runtime spent inside matvecs */
