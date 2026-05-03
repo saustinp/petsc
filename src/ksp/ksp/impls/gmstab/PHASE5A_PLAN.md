@@ -37,12 +37,34 @@ a per-baseline pass/drift/fail summary plus aggregate counts comparable to the
 **Total: 5 named single baselines + 125 cdr_sweep_small sub-baselines = 129.** ✓
 
 **Critical finding from inventory:** All 129 baselines use **`A_fun = @(v) A*v`** —
-unpreconditioned. None use split preconditioning or any other PC. So the natural
-PETSc mapping is `KSPSetPCSide(PC_NONE)` for every baseline. The PCSHELL/PC_SYMMETRIC
-infrastructure noted in the original Phase 5a harness directive (project memory
-`project_gmstab_phase5a_harness.md`) was based on a hypothetical I assumed —
-it isn't actually exercised by this baseline set. PC_SYMMETRIC support remains
-useful for users but isn't validated by Phase 5a.
+unpreconditioned. From `VALIDATION_PACKAGE_SUMMARY.md` §2.3:
+> All five [single-point tests] are unpreconditioned by design. The C++ port may
+> add preconditioning later; these baselines verify the underlying GM(s)stab
+> arithmetic without any ILU dependency mismatching between languages.
+
+This is **intentional** — the package authors deliberately stripped preconditioning
+to factor out implementation differences in MATLAB's `\` operator vs C++'s ILU
+backends. PETSc has the same parity issue, so the design choice serves us too.
+
+**What this means for Phase 5a's coverage:**
+
+| Configuration | Bit-equivalence (Phase 5a) | Weak correctness (Phase 4) |
+|---|---|---|
+| **PC_NONE** | ✅ 129 baselines | ✅ implicit |
+| **PC_LEFT** + jacobi/bjacobi/ilu/asm | ❌ no baselines exist | ✅ Phase 4b tripwires |
+| **PC_RIGHT** + jacobi/bjacobi/ilu/asm | ❌ no baselines exist | ✅ Phase 4a tripwires |
+| **PC_SYMMETRIC** + jacobi/bjacobi | ❌ no baselines exist | ✅ Phase 4c tripwires |
+
+Phase 5a validates the **algorithm core** (PC_NONE trajectory matches MATLAB/C++).
+It does NOT validate that the preconditioned trajectories match — that's deferred
+to **Phase 5b (task #70, follow-up)**, which requires new MATLAB-side baselines
+with explicit L/R factor dumps that PETSc can mirror via PCSHELL.
+
+This is a deliberate scope decision, not an oversight. The Phase 4 tripwires give
+us solution-correctness for preconditioned modes (the returned `x` satisfies
+`||b - A·x|| ≤ tol`); Phase 5b would add trajectory-level bit-equivalence on top of
+that. Both layers ultimately want to land, but they require different reference
+data and aren't blocking each other.
 
 **Per-baseline files:**
 - `linsys.bin` — EXASIMLS format (64-byte header + CSR rowptr/colidx/values + RHS)
@@ -410,6 +432,45 @@ Total: ~4-5 hours assuming clean runs at each stage.
 
 ---
 
+## 8.5. Diagnostic: detecting accidentally-preconditioned baselines
+
+**Watch-out:** the validation package authors state in `VALIDATION_PACKAGE_SUMMARY.md`
+§2.3 that all 129 baselines are unpreconditioned by design. If this is correct,
+PETSc-vs-MATLAB/C++ trajectory drift on these problems should be of the order seen
+in the existing `validation_summary.csv` (matvec drift up to ~13%, residual drift
+typically below 1× max-residual or bounded by the FAIL_DRIFT envelope).
+
+**However**, if any baseline accidentally has preconditioning baked into its
+`linsys.bin` matrix (e.g., the matrix stored is `L⁻¹·A·R⁻¹` rather than raw `A`),
+PETSc would still operate on it as if it were the original operator. The MATLAB
+reference would have generated trajectory data using its corresponding `A_fun`,
+which might or might not match the matrix actually written to `linsys.bin`. A
+preconditioning mismatch between the dumped matrix and the trajectory data would
+cause dramatic divergence — much larger than the ~1.5× drift envelope this plan
+budgets for.
+
+**If we see dramatic, anomalous divergence on a baseline that's supposed to be
+unpreconditioned, treat it as a flag for investigating whether the baseline is
+actually preconditioned**, in addition to the usual debug paths (BLAS-call-order
+drift, BGS conditioning, etc.). Specifically:
+
+- Compare `||b||_2` from `summary.txt` against `||b||_2` computed from the
+  loaded RHS. Mismatch ⇒ probably preconditioning baked in.
+- Compare matrix sparsity pattern against what's described in `summary.txt`
+  ("3D FDM CDR, 7-point stencil" should give a diagonal-banded sparsity, not
+  a full-fill from a factorization).
+- Check that the matrix's diagonal entries are approximately what a
+  finite-difference / SuiteSparse problem would have at that stencil/scale.
+- If still ambiguous, contact the package authors before chasing PETSc-side
+  bug hypotheses.
+
+**Add a sanity-check at harness-load-time** that emits a warning if `||b||`
+differs from summary.txt's stated value by more than 1e-12 — cheap to compute,
+cheap to log, catches the case where summary metadata and binary data
+disagree.
+
+---
+
 ## 9. What unblocks after Phase 5a
 
 - **Task #68 (Phase 4 follow-up)** can now execute. The pre-patch bit-equivalence
@@ -417,9 +478,15 @@ Total: ~4-5 hours assuming clean runs at each stage.
   expected snapshot-skipping rows changed.
 - **Phase 4e (GPU PCs)** can start — the CPU baseline is now validated, so any GPU
   divergence is a GPU-port issue, not a base-algorithm issue.
-- **External users** can now run gmstab with confidence — Phase 5a is the canonical
-  "we tested it" claim. The validation_summary_petsc.csv becomes a publishable
-  artifact.
+- **Phase 5b (preconditioner trajectory bit-equivalence — task #70)** can start
+  once new MATLAB-side baselines are generated with explicit L/R factor dumps
+  for split-preconditioning trajectories. Phase 5a's PC_NONE coverage is
+  necessary but not sufficient — Phase 5b will close the trajectory gap for
+  PC_LEFT, PC_RIGHT, and PC_SYMMETRIC under preconditioned operators.
+- **External users** can now run gmstab with confidence on unpreconditioned
+  problems and with weak-correctness assurances on preconditioned ones (Phase 4
+  tripwires). Phase 5a's `validation_summary_petsc.csv` becomes a publishable
+  artifact for the PC_NONE / algorithm-core claim.
 
 ---
 
