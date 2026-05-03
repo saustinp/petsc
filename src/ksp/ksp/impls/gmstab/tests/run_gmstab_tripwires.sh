@@ -21,6 +21,7 @@ VALIDATORS=(
   "ex_gmstab_phase3a"               # Initialisation bit-equivalence
   "ex_gmstab_init_nonzero_guess"    # constructor row stays correct with x0 != 0
   "ex_gmstab_cycle1"                # Cycle1 force_l1 trace vs C++ force_l1 trace
+  "ex_gmstab_cycle2"                # Cycle2 force_l2 trace vs C++ force_l2 trace
 )
 
 # Parallel runs of cycle1 (uses the same binary, varies mpiexec -n).
@@ -68,25 +69,28 @@ echo ""
 echo "[tripwires] sequential summary: $((total - fail_count))/$total passed"
 
 # ---- Parallel cycle1 runs ----
-parallel_total=${#PARALLEL_RANKS[@]}
+parallel_total=0
 parallel_fails=0
-cycle1_bin=/tmp/ex_gmstab_cycle1
-if [ -f "$cycle1_bin" ]; then
+PARALLEL_VALIDATORS=(ex_gmstab_cycle1 ex_gmstab_cycle2)
+for v in "${PARALLEL_VALIDATORS[@]}"; do
+  bin=/tmp/$v
+  if [ ! -f "$bin" ]; then
+    echo "[tripwires] $bin missing — skipping its parallel runs"
+    continue
+  fi
   for n in "${PARALLEL_RANKS[@]}"; do
-    echo "[tripwires] running ex_gmstab_cycle1 on $n MPI ranks..."
-    if "$MPIEXEC" -n "$n" "$cycle1_bin" >"/tmp/ex_gmstab_cycle1.np${n}.log" 2>&1; then
-      echo "[tripwires] ex_gmstab_cycle1 (n=$n): PASS"
+    parallel_total=$((parallel_total + 1))
+    echo "[tripwires] running $v on $n MPI ranks..."
+    if "$MPIEXEC" -n "$n" "$bin" >"/tmp/${v}.np${n}.log" 2>&1; then
+      echo "[tripwires] $v (n=$n): PASS"
     else
       rc=$?
-      echo "[tripwires] ex_gmstab_cycle1 (n=$n): FAIL (exit $rc) — see /tmp/ex_gmstab_cycle1.np${n}.log"
-      tail -10 "/tmp/ex_gmstab_cycle1.np${n}.log" | sed 's/^/[tripwires]   /'
+      echo "[tripwires] $v (n=$n): FAIL (exit $rc) — see /tmp/${v}.np${n}.log"
+      tail -10 "/tmp/${v}.np${n}.log" | sed 's/^/[tripwires]   /'
       parallel_fails=$((parallel_fails + 1))
     fi
   done
-else
-  echo "[tripwires] $cycle1_bin missing — skipping parallel runs"
-  parallel_total=0
-fi
+done
 
 echo ""
 echo "[tripwires] parallel summary: $((parallel_total - parallel_fails))/$parallel_total passed (ranks: ${PARALLEL_RANKS[*]})"

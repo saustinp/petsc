@@ -214,6 +214,30 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
     PetscFunctionReturn(PETSC_SUCCESS);
   }
 
+  if (gms->force_l2_only) {
+    /* Symmetric to force_l1_only: begin-of-cycle snapshot, one Cycle2,
+       post-cycle snapshot, exit. */
+    PetscCall(KSPGMSTABSnapshot_Private(ksp, gms, x_local, beta_curr));
+
+    PetscCall(KSPGMSTABCycle2_Private(ksp, gms, &ws, x_local, gms->r, &beta_curr));
+    gms->beta = beta_curr;
+    gms->cycle_count++;
+    gms->n2cycles++;
+
+    PetscCall(KSPGMSTABSnapshot_Private(ksp, gms, x_local, beta_curr));
+
+    if (gms->beta <= ksp->abstol) {
+      ksp->reason = KSP_CONVERGED_ATOL;
+    } else if (!ksp->reason) {
+      ksp->reason = KSP_DIVERGED_BREAKDOWN;
+      PetscCall(PetscInfo(ksp,
+        "KSPSolve_GMSTAB force_l2_only: ran one Cycle2, beta=%.6e > tolabs=%.6e\n",
+        (double)gms->beta, (double)ksp->abstol));
+    }
+    PetscCall(KSPGMSTABInnerWorkspaceDestroy_Private(&ws));
+    PetscFunctionReturn(PETSC_SUCCESS);
+  }
+
   /* Phase 3a checkpoint: cycle bodies not yet wired into the production
      driver loop (cycle2 + flying restart still pending). */
   ksp->reason = KSP_DIVERGED_BREAKDOWN;
@@ -583,15 +607,21 @@ static PetscErrorCode KSPSetFromOptions_GMSTAB(KSP ksp, PetscOptionItems PetscOp
             NULL, gms->n2cycles_max, &this_int, &flg));
   if (flg) gms->n2cycles_max = this_int;
 
-  /* Phase 3b validation knob — runs exactly one Cycle1 after Initialisation
-     and exits, so the cycle's algebra can be diff'd against the C++ oracle
-     in isolation from the driver loop. Off in production. */
+  /* Phase 3b validation knobs — run exactly one Cycle{1,2} after
+     Initialisation and exit. Used by ex_gmstab_cycle{1,2} to validate
+     the cycle's algebra against the C++ oracle in isolation. Off in
+     production. */
   {
     PetscBool this_bool;
     PetscCall(PetscOptionsBool("-ksp_gmstab_force_l1_only",
               "validation: run exactly ONE Cycle1 after Initialisation, then exit BREAKDOWN",
               NULL, gms->force_l1_only, &this_bool, &flg));
     if (flg) gms->force_l1_only = this_bool;
+
+    PetscCall(PetscOptionsBool("-ksp_gmstab_force_l2_only",
+              "validation: run exactly ONE Cycle2 after Initialisation, then exit BREAKDOWN",
+              NULL, gms->force_l2_only, &this_bool, &flg));
+    if (flg) gms->force_l2_only = this_bool;
   }
 
   /* Recycling — Phase 8 only. Knob is exposed but warning issued if used. */
@@ -697,6 +727,7 @@ PETSC_EXTERN PetscErrorCode KSPCreate_GMSTAB(KSP ksp)
   gms->c_replace     = (PetscReal)1e-2;
   gms->n2cycles_max  = 3;
   gms->force_l1_only = PETSC_FALSE;
+  gms->force_l2_only = PETSC_FALSE;
   gms->stab_angle    = KSPGMSTAB_DEFAULT_STAB_ANGLE;
   gms->tolabs2       = PETSC_INFINITY;
   gms->has_recycling = PETSC_FALSE;

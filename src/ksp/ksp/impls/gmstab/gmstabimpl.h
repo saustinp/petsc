@@ -51,6 +51,14 @@ typedef struct {
                                    reached. Used by ex_gmstab_cycle1 to
                                    isolate cycle 1 from the flying-restart
                                    driver (Phase 3b validation). */
+  PetscBool   force_l2_only;    /* validation knob (default PETSC_FALSE):
+                                   symmetric to force_l1_only. Runs
+                                   Initialisation + exactly ONE Cycle2 +
+                                   exits. If both force_l1_only and
+                                   force_l2_only are set, force_l1_only
+                                   wins (matches the C++ port's
+                                   GMSTAB_FORCE_L1 vs GMSTAB_FORCE_L2
+                                   precedence). */
 
   /* Recycling parameters (Phase 8 only — left at off / NULL until then) */
   PetscReal   tolabs2;          /* dump hU when iter-residual exceeds this;
