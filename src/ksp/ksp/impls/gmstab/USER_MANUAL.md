@@ -210,6 +210,37 @@ You can also change `PCSide` between solves on the same `KSP` (e.g., `PC_RIGHT` 
 solve, then `PC_LEFT` second). The conditional `x_initial_guess` allocation handles
 this correctly. Verified by `ex_gmstab_pc_multisolve` Scenario 3.
 
+### Global options leak between solves (PETSc convention, not gmstab-specific)
+
+If you configure sub-PC options via `PetscOptionsSetValue` (e.g.,
+`-sub_pc_type jacobi` to make `PCBJACOBI + PC_SYMMETRIC` work — see §8 for why this
+is needed), **those options persist in PETSc's global options database** until
+explicitly cleared. They will apply to *any* subsequent `KSP`/`PC` you create in the
+same process, not just the one you set them for.
+
+This isn't a gmstab quirk — it's how PETSc's options database works. But it's worth
+flagging because the workaround for `PC_SYMMETRIC + PCBJACOBI` (set
+`-sub_pc_type jacobi`) is the most common case where users will encounter the leak.
+
+**Symptoms of unintended leak:**
+- Subsequent `PCBJACOBI` solves quietly use `PCJACOBI` sub-PCs instead of the default
+  `KSPPREONLY+PCILU`, changing convergence behavior.
+- `PCASM` solves likewise inherit `-sub_pc_type jacobi`.
+
+**Clean it up:**
+```c
+PetscOptionsClearValue(NULL, "-sub_pc_type");
+PetscOptionsClearValue(NULL, "-sub_ksp_type");
+```
+
+Best practice: scope these calls tightly around the solve that needs them, and clear
+them immediately after. Or use the `PetscObjectOptionsBegin/End` push-pop API for
+options that should apply to a single object only.
+
+The internal sweep tripwire `tests/ex_gmstab_pcsymmetric_sweep.c` doesn't clear these
+options because each `run_one` re-sets them before its own `KSPSetFromOptions` — but
+production code that mixes PCBJACOBI configurations should clear explicitly.
+
 ---
 
 ## 7. Parallel execution
