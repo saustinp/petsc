@@ -120,6 +120,16 @@ typedef struct {
   /* Driver state (flying restart) */
   Vec         x_global;         /* solution accumulator (xGlobal in C++ port);
                                    x_local lives in ksp->vec_sol */
+  Vec         x_initial_guess;  /* user's initial guess at solve start —
+                                   captured BEFORE x_local is zeroed. Only
+                                   allocated when pc_side ∈ {PC_RIGHT,
+                                   PC_SYMMETRIC}; for those modes the algorithm
+                                   tracks x_alg = x_global + x_local in the
+                                   M-space, and the user-visible solution is
+                                   x_user = x_initial_guess + B⁻¹·(x_alg −
+                                   x_initial_guess). For PC_NONE / PC_LEFT this
+                                   field stays NULL — x_alg = x_user, no unwrap
+                                   needed. Phase 4a. */
   Vec         b_local;          /* current right-hand side after restart */
   PetscReal   beta_local;       /* ||b_local|| at last restart */
   PetscReal   beta_max;         /* sup over residual norms since last full

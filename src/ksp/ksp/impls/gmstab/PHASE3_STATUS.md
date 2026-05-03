@@ -814,6 +814,53 @@ Translating each pattern into a concrete checklist for Phase 4 / 5a:
    `Create`/`Init` functions. Stack-allocated structs need explicit
    initialisation of every field.
 
+## Phase 4 — preconditioner sides (right, left); CPU PC sweep
+
+Phase 4 brings `KSPGMSTAB` to functional parity with PETSc's PC framework.
+The plan is in `PHASE4_PLAN.md`; the audit findings are below.
+
+### Bug catalog (continuation of Phase 3d)
+
+| # | Pass | Site | Fix |
+|---|---|---|---|
+| 11 | Phase 4a | `KSPSolve_GMSTAB`'s 5 return paths each had inline `VecAXPY(x_local, 1.0, gms->x_global)` (Pattern B again). For PC_RIGHT correctness we needed to apply `B⁻¹` instead of plain accumulation. | Added `KSPGMSTABFinalizeSolution_Private`; replaced all 5 inline accumulations with the helper call. |
+| 12 | Phase 4a | `bLocal = b − A·x_initial` was computed via `KSP_PCApplyBAorAB`, which for PC_RIGHT returns `A·B⁻¹·x_initial` (giving `b − A·B⁻¹·x_initial`, not the unpreconditioned residual the algorithm assumes). Latent: invisible when `x_initial = 0`; off by `A·(I − B⁻¹)·x_initial` otherwise (caught by the new `ex_gmstab_pcright_nzg` tripwire). | Switched to plain `MatMult(Amat, gms->x_global, Ax)` for the bLocal computation. For PC_NONE this is identical to the previous `KSP_PCApplyBAorAB` call. |
+| 13 | Phase 4b | `bLocal` was in unpreconditioned algebra while the cycle's matvecs go through `KSP_PCApplyBAorAB → B⁻¹·A` for PC_LEFT, leaving the residual algebra inconsistent. | Apply `PCApply` to bLocal once at solve start when `pc_side == PC_LEFT`; cycles' algebra is then consistent in M-space throughout. |
+| 14 | Phase 4b | The natural-flow loop's exit checks (`while (beta_curr > ksp->abstol)` and `if (beta_curr <= ksp->abstol) reason=ATOL; break;`) used the algorithm-internal `beta_curr`, which for PC_LEFT is `‖r_pre‖`, not the user-visible residual. Premature exit when `‖r_pre‖ ≤ abstol` but `‖r_unpre‖ > abstol` — caught by the first run of `ex_gmstab_pcleft_jacobi` failing with rnorm=4e-10. | Made the loop reason-driven: it iterates until `KSPConvergedDefault` (called via `Snapshot_Private`) sets `ksp->reason`, which already uses the right residual per the user's `KSPSetNormType`. |
+| 15 | Phase 4b | Some PC_LEFT + tough-PC combinations (e.g. small-block PCBJACOBI on cdr_small at n=8) loop for millions of snapshots before a numerical event terminates them. `KSPConvergedDefault`'s DIVERGED_ITS check appears to not fire for this KSP type as expected. | Added a defensive runaway cap at `100 × ksp->max_it` cycles; sets `KSP_DIVERGED_ITS` and exits. The PC_LEFT + small-block-BJacobi limitation is also documented and skipped at `n ≥ 8` in the bjacobi tripwire. |
+
+### New tripwires (Phase 4)
+
+| Validator | Phase | Coverage |
+|---|---|---|
+| `ex_gmstab_pcright_jacobi` | 4a | Basic PC_RIGHT correctness with PCJACOBI; verifies external residual matches internal rnorm to FP precision. |
+| `ex_gmstab_pcright_nzg` | 4a | PC_RIGHT + nonzero initial guess. Catches the `bLocal = b − A·B⁻¹·x_initial` bug (Bug 12) — without the fix, ext_res = ~85 instead of ~1e-10. |
+| `ex_gmstab_pcleft_jacobi` | 4b | Basic PC_LEFT correctness with PCJACOBI. Caught the convergence-target-mismatch bug (Bug 14). |
+| `ex_gmstab_pcleft_bjacobi` | 4b | PC_LEFT + parallel-default PCBJACOBI; skips `n ≥ 8` (documented small-block ILU stall). |
+| `ex_gmstab_pc_sweep` | 4d | Cross-product `(pc_side, pc_type)` for `pc_type ∈ {Jacobi, BJacobi, SOR, ILU, ASM}`. Skips the documented 2 known-bad combinations (PC_LEFT+SOR everywhere, PC_LEFT+BJacobi at `n ≥ 8`). |
+
+### Pattern frequency (updated)
+
+Phase 4 found 5 more bugs, mostly Pattern B (multi-path) and Pattern D (off-by-statement / wrong-residual). Updated taxonomy frequency:
+
+| Pattern | Phase 3d count | Phase 4 count | Total |
+|---|---|---|---|
+| A: Init-once-never-reset | 4 | 0 | 4 |
+| B: Multi-path invariant violation | 2 | 1 (Bug 11) | 3 |
+| C: Snapshot rhythm divergence | 3 | 0 | 3 |
+| D: Off-by-statement bookkeeping | 1 | 3 (Bugs 12, 13, 14) | 4 |
+| E: Latent uninitialised state | 1 | 0 | 1 |
+| F: Defensive runaway cap (new pattern) | 0 | 1 (Bug 15) | 1 |
+
+Pattern D (off-by-statement / wrong-residual / wrong-algebra) jumped from 1 to 4. Phase 4 reinforced the Phase 3d audit checklist's #4: **order-of-operations matters for scalar fields, AND the operator side / residual algebra also has to match across every site**.
+
+### Final tripwire suite: 60/60 PASS (was 40/40 after Phase 3d)
+
+* 15 sequential validators (added `pcright_jacobi`, `pcright_nzg`, `pcleft_jacobi`, `pcleft_bjacobi`, `pc_sweep`)
+* 39 parallel runs (cycle1, cycle2, natural, natural_nzg, determinism, multisolve, multisolve_rng, schange, pcright_jacobi, pcright_nzg, pcleft_jacobi, pcleft_bjacobi, pc_sweep × ranks ∈ {2, 4, 8})
+* 4 dump-level cross-checks (cycle1, cycle2 × ranks ∈ {2, 4})
+* 2 trace-level cross-checks (natural seq-vs-parallel × ranks ∈ {2, 4})
+
 ## How to resume
 
 ```bash
@@ -821,7 +868,7 @@ Translating each pattern into a concrete checklist for Phase 4 / 5a:
 cd /home/sam/hpc_stack/petsc
 git status   # should be clean on ksp-gmstab
 src/ksp/ksp/impls/gmstab/tests/run_gmstab_tripwires.sh
-# Expect: 40/40 PASS
+# Expect: 60/60 PASS
 
 # 2. Move on to Phase 4 (preconditioner sides) or Phase 5a (full
 #    sweep validation against the 129 baselines).

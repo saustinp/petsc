@@ -129,9 +129,16 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
      multi-solve without an explicit KSPReset between. The Mats and Z buffer
      are also sized by `s`, so destroying them is the only safe way to
      handle a user that changes s with KSPGMSTABSetS between solves —
-     Initialisation re-allocates V0/V1/Z lazily on the first cycle. */
+     Initialisation re-allocates V0/V1/Z lazily on the first cycle.
+
+     gms->x_initial_guess (Phase 4a) is allocated/copied AFTER this destroy
+     block on a per-solve basis when pc_side ∈ {PC_RIGHT, PC_SYMMETRIC};
+     destroying here means a previous solve in PC_RIGHT mode can't leak
+     stale state into a subsequent PC_NONE solve, and that the Vec is
+     fresh-from-b on each invocation regardless of pc_side history. */
   PetscCall(VecDestroy(&gms->b_local));
   PetscCall(VecDestroy(&gms->x_global));
+  PetscCall(VecDestroy(&gms->x_initial_guess));
   PetscCall(VecDestroy(&gms->r));
   PetscCall(VecDestroy(&gms->work_n));
   PetscCall(VecDestroy(&gms->work_n2));
@@ -146,6 +153,29 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
   /* xGlobal := initial guess (which is x_local on entry; if user provided
      KSPSetInitialGuessNonzero this is non-zero). */
   PetscCall(VecCopy(x_local, gms->x_global));
+
+  /* Phase 4a — for PC_RIGHT (and PC_SYMMETRIC, deferred), save the user's
+     initial guess in a dedicated Vec. The algorithm internally tracks
+     x_alg = x_global + x_local in the M-space (where M = A·B⁻¹). At solve
+     end the user-visible solution is recovered as
+     x_user = x_initial + B⁻¹·(x_alg − x_initial). Without this save we
+     can't recover x_user after the algorithm has accumulated restart
+     contributions into x_global.
+
+     Done AFTER the per-solve VecDestroy block above (so a stale Vec from
+     a prior solve is freed) and BEFORE the VecSet(x_local, 0.0) below
+     (so the initial guess is still readable from x_global / x_local). */
+  {
+    PCSide pc_side_for_init;
+    PetscCall(KSPGetPCSide(ksp, &pc_side_for_init));
+    if (pc_side_for_init == PC_RIGHT || pc_side_for_init == PC_SYMMETRIC) {
+      PetscCall(VecDuplicate(b, &gms->x_initial_guess));
+      PetscCall(VecCopy(gms->x_global, gms->x_initial_guess));
+    }
+    /* For PC_NONE / PC_LEFT, gms->x_initial_guess stays NULL — the
+       algorithm-internal x_alg coincides with x_user, and the destroy
+       block above guarantees there's no stale Vec lurking. */
+  }
 
   /* Constructor snapshot — matches the C++ port's PerfMeasure constructor:
      iter=0, matvec=0, iterres=||b||, trueres=||b||, runtime=0.
@@ -173,15 +203,53 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
   PetscCall(KSPGMSTABInnerWorkspaceCreate_Private(ksp, gms->s, 2 * gms->s + 2, b, &ws));
   ws.matvec_count_ptr = &gms->matvec_count;
 
-  /* bLocal = b - A * xGlobal (counted matvec). */
+  /* bLocal = b - A * x_initial (counted matvec).
+     CRUCIAL: this must be the UNPRECONDITIONED residual (one bare A
+     application, NOT KSP_PCApplyBAorAB). The algorithm's M-space
+     residual algebra is set up so that
+         r = bLocal - M·x_alg = b - A·x_user
+     which only holds if bLocal = b - A·x_initial. Using
+     KSP_PCApplyBAorAB here would compute b - M·x_initial, leaving the
+     residual permanently offset by `A·(I − B⁻¹)·x_initial` — invisible
+     when x_initial = 0 (the bit-equivalence harness) but catastrophic
+     for KSPSetInitialGuessNonzero with PC_RIGHT, as Phase 4a's
+     ex_gmstab_pcright_nzg tripwire demonstrated.
+     For PC_NONE this is identical to the previous behavior since
+     KSP_PCApplyBAorAB(PC_NONE) is just MatMult(A). */
   Mat Amat;
   PetscCall(KSPGetOperators(ksp, &Amat, NULL));
   Vec Ax;
   PetscCall(VecDuplicate(b, &Ax));
-  PetscCall(KSP_PCApplyBAorAB(ksp, gms->x_global, Ax, ws.work_n));   /* counted */
+  PetscCall(MatMult(Amat, gms->x_global, Ax));
   gms->matvec_count++;
   PetscCall(VecWAXPY(gms->b_local, -1.0, Ax, b));
   PetscCall(VecDestroy(&Ax));
+
+  /* Phase 4b — for PC_LEFT we solve B⁻¹·A·x = B⁻¹·b. Convert bLocal to
+     its preconditioned form ONCE here; from this point on the algorithm
+     operates in B⁻¹·A's M-space and tracks r_pre = B⁻¹·(b − A·x_user).
+     The cycles already use KSP_PCApplyBAorAB which dispatches B⁻¹·A on
+     PC_LEFT, so r := bLocal_pre − M·x_local stays consistent with
+     B⁻¹·(b − A·x_user) throughout the solve.
+
+     The PCApply is uncounted (it's PC setup-equivalent work, not an
+     A-matvec). Done after bLocal is fully formed and before VecCopy
+     into gms->r below.
+
+     For PC_NONE / PC_RIGHT / PC_SYMMETRIC this block is a no-op. */
+  {
+    PCSide pc_side_for_blocal;
+    PetscCall(KSPGetPCSide(ksp, &pc_side_for_blocal));
+    if (pc_side_for_blocal == PC_LEFT) {
+      Vec b_pre;
+      PetscCall(VecDuplicate(b, &b_pre));
+      PC pc;
+      PetscCall(KSPGetPC(ksp, &pc));
+      PetscCall(PCApply(pc, gms->b_local, b_pre));
+      PetscCall(VecCopy(b_pre, gms->b_local));
+      PetscCall(VecDestroy(&b_pre));
+    }
+  }
 
   PetscCall(VecCopy(gms->b_local, gms->r));
   PetscCall(VecSet(x_local, 0.0));
@@ -204,18 +272,21 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
   if (ksp->reason && ksp->reason != KSP_CONVERGED_ITERATING) {
     /* Convergence test inside Initialisation OR the post-init dup
        triggered. After this point x_local has been zeroed and
-       accumulates the cycle-local update; the full user-visible solution
-       is x_global + x_local. (For zero initial guess this VecAXPY is a
-       no-op; for nonzero initial guess this restores the caller's
-       KSPSetInitialGuessNonzero contract.) */
-    PetscCall(VecAXPY(x_local, 1.0, gms->x_global));
+       accumulates the cycle-local update. FinalizeSolution_Private
+       turns x_local into the user-visible solution: for PC_NONE/PC_LEFT
+       this is x_global + x_local; for PC_RIGHT it adds the B⁻¹
+       unwrap. (For zero initial guess + PC_NONE this is the
+       previous-Phase-3d VecAXPY no-op; for nonzero initial guess +
+       PC_NONE it restores the KSPSetInitialGuessNonzero contract; for
+       PC_RIGHT it produces the correct x_user via Phase 4a's algebra.) */
+    PetscCall(KSPGMSTABFinalizeSolution_Private(ksp, gms, x_local));
     PetscCall(KSPGMSTABInnerWorkspaceDestroy_Private(&ws));
     PetscFunctionReturn(PETSC_SUCCESS);
   }
 
   if (gms->beta <= ksp->abstol) {
     ksp->reason = KSP_CONVERGED_ATOL;
-    PetscCall(VecAXPY(x_local, 1.0, gms->x_global));
+    PetscCall(KSPGMSTABFinalizeSolution_Private(ksp, gms, x_local));
     PetscCall(KSPGMSTABInnerWorkspaceDestroy_Private(&ws));
     PetscFunctionReturn(PETSC_SUCCESS);
   }
@@ -243,7 +314,7 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
         "KSPSolve_GMSTAB force_l1_only: ran one Cycle1, beta=%.6e > tolabs=%.6e\n",
         (double)gms->beta, (double)ksp->abstol));
     }
-    PetscCall(VecAXPY(x_local, 1.0, gms->x_global));
+    PetscCall(KSPGMSTABFinalizeSolution_Private(ksp, gms, x_local));
     PetscCall(KSPGMSTABInnerWorkspaceDestroy_Private(&ws));
     PetscFunctionReturn(PETSC_SUCCESS);
   }
@@ -266,7 +337,7 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
         "KSPSolve_GMSTAB force_l2_only: ran one Cycle2, beta=%.6e > tolabs=%.6e\n",
         (double)gms->beta, (double)ksp->abstol));
     }
-    PetscCall(VecAXPY(x_local, 1.0, gms->x_global));
+    PetscCall(KSPGMSTABFinalizeSolution_Private(ksp, gms, x_local));
     PetscCall(KSPGMSTABInnerWorkspaceDestroy_Private(&ws));
     PetscFunctionReturn(PETSC_SUCCESS);
   }
@@ -300,7 +371,50 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
   Vec Ax_drv;
   PetscCall(VecDuplicate(b, &Ax_drv));   /* scratch for the counted matvec at restart/replace */
 
-  while (beta_curr > ksp->abstol) {
+  /* Loop continues until KSPConvergedDefault sets ksp->reason (via the
+     snapshots inside the cycle / dir_rbio / end-of-iter), or we hit some
+     other termination set externally on ksp->reason.
+
+     IMPORTANT (Phase 4b): the loop is REASON-driven, not beta-driven. The
+     algorithm-internal beta_curr is the *natural* residual of the
+     preconditioned operator: ||r_unpre|| for PC_NONE / PC_RIGHT (those
+     two algebras leave the tracked r in unpreconditioned form), but
+     ||r_pre|| for PC_LEFT. The user's tolerance applies to the residual
+     they asked for via KSPSetNormType (UNPRECONDITIONED → ||r_unpre||).
+     Snapshot_Private's call to (*ksp->converged) does that check on the
+     CORRECT residual for the user's normtype; the driver's job is just
+     to honor the resulting ksp->reason.
+
+     A previous version of this loop also early-broke on
+     `beta_curr <= ksp->abstol`. That short-circuit is correct for
+     PC_NONE / PC_RIGHT (where beta_curr ~ user-visible residual) but
+     incorrect for PC_LEFT (where ||r_pre|| can be << ||r_unpre|| under
+     a well-conditioned preconditioner — Phase 4b's pcleft_jacobi
+     tripwire caught the regression before this fix). The right safety
+     net is `if (ksp->reason && reason != ITERATING) break`, which fires
+     uniformly across all PC sides. */
+  /* Defensive runaway-iteration cap (Phase 4b). On some PC_LEFT +
+     poorly-conditioned-PC combinations we observed iteration counts
+     reaching millions of snapshots before a numerical event terminated
+     the solve, indicating that KSPConvergedDefault's DIVERGED_ITS check
+     wasn't firing as expected for this KSP type. The cap below fires at
+     `100 * max_it` cycles, which for a typical max_it=2000 means 200K
+     cycles — comfortably above any well-conditioned solve's needs (the
+     PC_LEFT + Jacobi cdr_small case takes ~250 cycles), but bounded so
+     a stuck PC_LEFT + small-block-BJacobi cdr_small at n=8 exits
+     gracefully as DIVERGED_ITS instead of running unbounded. */
+  const PetscInt runaway_cycle_cap = 100 * (ksp->max_it > 0 ? ksp->max_it : 10000);
+  while (!ksp->reason || ksp->reason == KSP_CONVERGED_ITERATING) {
+    if (gms->cycle_count >= runaway_cycle_cap) {
+      ksp->reason = KSP_DIVERGED_ITS;
+      PetscCall(PetscInfo(ksp,
+        "KSPSolve_GMSTAB: runaway-iteration cap fired at cycle_count=%" PetscInt_FMT
+        " (cap = 100 * max_it = %" PetscInt_FMT "). KSPConvergedDefault did not "
+        "set a converged reason in time; signalling DIVERGED_ITS.\n",
+        gms->cycle_count, runaway_cycle_cap));
+      break;
+    }
+
     PetscBool t_restart = PETSC_FALSE, t_replace = PETSC_FALSE;
     if (beta_curr < gms->c_restart * gms->beta_local) {
       t_restart = PETSC_TRUE;
@@ -326,10 +440,6 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
 
     /* Cycle's internal final snapshot may have triggered convergence /
        divergence via KSPConvergedDefault. Honour that. */
-    if (beta_curr <= ksp->abstol) {
-      ksp->reason = KSP_CONVERGED_ATOL;
-      break;
-    }
     if (ksp->reason && ksp->reason != KSP_CONVERGED_ITERATING) break;
 
     if (t_restart || t_replace) {
@@ -383,18 +493,26 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
     if (ksp->reason && ksp->reason != KSP_CONVERGED_ITERATING) break;
   }
 
-  /* If the loop exited solely on the natural while-condition (beta <= abstol),
-     KSPConvergedDefault may not have fired KSP_CONVERGED_ATOL via the most
-     recent snapshot — make sure we report ATOL rather than ITERATING. */
-  if (beta_curr <= ksp->abstol && (!ksp->reason || ksp->reason == KSP_CONVERGED_ITERATING)) {
-    ksp->reason = KSP_CONVERGED_ATOL;
+  /* The loop is reason-driven (Phase 4b refactor). If we exit with
+     ksp->reason still ITERATING, something unusual happened — typically
+     a KSPConvergedDefault decision that didn't classify (shouldn't be
+     possible, but defensive). Set DIVERGED_BREAKDOWN so the user sees a
+     diagnostic rather than a silent ITERATING-but-returned. */
+  if (!ksp->reason || ksp->reason == KSP_CONVERGED_ITERATING) {
+    ksp->reason = KSP_DIVERGED_BREAKDOWN;
+    PetscCall(PetscInfo(ksp,
+      "KSPSolve_GMSTAB: natural-flow loop exited with ksp->reason=ITERATING "
+      "(unexpected — KSPConvergedDefault should always classify); reporting "
+      "DIVERGED_BREAKDOWN. Last beta_curr=%.6e tolabs=%.6e\n",
+      (double)beta_curr, (double)ksp->abstol));
   }
 
-  /* On exit, leave the user-visible solution in ksp->vec_sol. The C++ port
-     returns out.x = local x, but that's only meaningful when xGlobal=0
-     (no restart fired). To mirror the *true* solution under the flying-
-     restart algebra, we accumulate xGlobal into x_local before returning. */
-  PetscCall(VecAXPY(x_local, 1.0, gms->x_global));
+  /* On exit, leave the user-visible solution in ksp->vec_sol.
+     FinalizeSolution_Private subsumes the historical
+     `VecAXPY(x_local, 1.0, gms->x_global)` accumulation and additionally
+     applies the right-preconditioning unwrap when pc_side == PC_RIGHT
+     (Phase 4a). For PC_NONE this is identical to the prior behavior. */
+  PetscCall(KSPGMSTABFinalizeSolution_Private(ksp, gms, x_local));
 
   PetscCall(VecDestroy(&Ax_drv));
   PetscCall(KSPGMSTABInnerWorkspaceDestroy_Private(&ws));
@@ -470,6 +588,7 @@ static PetscErrorCode KSPReset_GMSTAB(KSP ksp)
   PetscCall(VecDestroy(&gms->work_n));
   PetscCall(VecDestroy(&gms->work_n2));
   PetscCall(VecDestroy(&gms->x_global));
+  PetscCall(VecDestroy(&gms->x_initial_guess));
   PetscCall(VecDestroy(&gms->b_local));
   PetscCall(PetscFree(gms->Z));
   if (gms->trace_fp) {

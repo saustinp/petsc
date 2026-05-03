@@ -70,3 +70,23 @@ PETSC_INTERN PetscErrorCode KSPGMSTABSnapshot_Private(KSP ksp, KSP_GMSTAB *gms,
    they should keep using KSPGMSTABSnapshot_Private directly. */
 PETSC_INTERN PetscErrorCode KSPGMSTABSnapshotLocal_Private(KSP ksp, KSP_GMSTAB *gms,
                                                             Vec x_local, PetscReal iter_norm);
+
+/* Phase 4a — finalize the user-visible solution before returning from
+   KSPSolve_GMSTAB. Walks the algorithm-internal x_alg = x_global + x_local
+   into the user's algebra, applying the inverse of any right/symmetric
+   preconditioning. Specifically:
+
+     pc_side = PC_NONE  or PC_LEFT   →  x_local := x_global + x_local
+     pc_side = PC_RIGHT              →  x_local := x_initial_guess + B⁻¹ ·
+                                                  (x_global + x_local − x_initial_guess)
+     pc_side = PC_SYMMETRIC          →  TODO (Phase 4c) — currently treated as PC_RIGHT,
+                                        which is exact for the common B = B_R case but
+                                        not strictly correct for split symmetric PCs.
+
+   Must be called from EVERY return path in KSPSolve_GMSTAB that returns
+   AFTER `VecSet(x_local, 0.0)` has zeroed the initial guess in x_local.
+   Idempotent for PC_NONE/PC_LEFT; for PC_RIGHT it does the unwrap in place
+   on x_local. Callers must not VecAXPY x_global into x_local separately —
+   this helper subsumes that. */
+PETSC_INTERN PetscErrorCode KSPGMSTABFinalizeSolution_Private(KSP ksp, KSP_GMSTAB *gms,
+                                                               Vec x_local);

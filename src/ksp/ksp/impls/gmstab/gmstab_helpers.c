@@ -35,6 +35,75 @@ PETSC_INTERN PetscErrorCode KSPGMSTABSnapshotLocal_Private(KSP ksp, KSP_GMSTAB *
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
+/* ============================================================================
+ * KSPGMSTABFinalizeSolution_Private (Phase 4a)
+ *
+ *   Finalize x_local to the user-visible solution before KSPSolve_GMSTAB
+ *   returns. Subsumes the per-return-path "x_local += x_global"
+ *   accumulation that Phase 3d's audit established for PC_NONE / PC_LEFT,
+ *   and adds the right-preconditioning unwrap for PC_RIGHT.
+ *
+ *   Algebra:
+ *     PC_NONE / PC_LEFT:  x_user = x_global + x_local       (unchanged)
+ *     PC_RIGHT:           x_user = x_initial + B⁻¹ · (x_global + x_local
+ *                                                       − x_initial)
+ *     PC_SYMMETRIC:       same as PC_RIGHT for now (Phase 4c TODO)
+ *
+ *   Idempotency: callers must only call this once per solve and must
+ *   NOT VecAXPY x_global into x_local separately. The legacy inline
+ *   `VecAXPY(x_local, 1.0, gms->x_global)` at every return path is now
+ *   replaced by a call to this helper.
+ *
+ *   Pattern-B safety (multi-path invariant violation): one helper, called
+ *   uniformly by every exit, ensures the post-condition "x_local = x_user"
+ *   holds regardless of which return path fired.
+ * ============================================================================ */
+PETSC_INTERN PetscErrorCode KSPGMSTABFinalizeSolution_Private(KSP ksp, KSP_GMSTAB *gms,
+                                                               Vec x_local)
+{
+  PetscFunctionBegin;
+  PCSide pc_side;
+  PetscCall(KSPGetPCSide(ksp, &pc_side));
+
+  if (pc_side == PC_RIGHT || pc_side == PC_SYMMETRIC) {
+    /* Right (or symmetric, treated as right for now) preconditioning:
+       x_user = x_initial + B⁻¹ · (x_global + x_local − x_initial).
+       The Vec x_initial_guess MUST have been allocated at solve start
+       (gmstab.c does this conditionally on pc_side); if it's NULL here,
+       something has gone wrong upstream. */
+    PetscCheck(gms->x_initial_guess, PetscObjectComm((PetscObject)ksp), PETSC_ERR_PLIB,
+               "KSPGMSTABFinalizeSolution_Private: pc_side=%d but gms->x_initial_guess is NULL — "
+               "the solve-start initial-guess save was skipped or destroyed prematurely",
+               (int)pc_side);
+
+    /* Compute Σ_xa = (x_global + x_local) − x_initial in a scratch Vec.
+       Reuse gms->work_n if available (the same scratch SnapshotLocal uses);
+       lazily allocate if not, matching the pattern in SnapshotLocal. */
+    if (!gms->work_n) {
+      PetscCall(VecDuplicate(x_local, &gms->work_n));
+    }
+    PetscCall(VecCopy(gms->x_global, gms->work_n));
+    PetscCall(VecAXPY(gms->work_n, 1.0, x_local));
+    PetscCall(VecAXPY(gms->work_n, -1.0, gms->x_initial_guess));
+    /* gms->work_n now holds (x_global + x_local − x_initial). */
+
+    /* Apply B⁻¹ to Σ_xa, writing the result back into x_local. PCApply
+       handles parallel layouts and any matrix-free PC correctly. */
+    PC pc;
+    PetscCall(KSPGetPC(ksp, &pc));
+    PetscCall(PCApply(pc, gms->work_n, x_local));
+    /* x_local now holds B⁻¹ · Σ_xa. */
+
+    /* Add x_initial back to recover x_user. */
+    PetscCall(VecAXPY(x_local, 1.0, gms->x_initial_guess));
+    /* x_local now holds the user-visible solution. */
+  } else {
+    /* PC_NONE or PC_LEFT: algorithm-internal x_alg coincides with x_user. */
+    PetscCall(VecAXPY(x_local, 1.0, gms->x_global));
+  }
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
 PETSC_INTERN PetscErrorCode KSPGMSTABSnapshot_Private(KSP ksp, KSP_GMSTAB *gms,
                                                        Vec x_total, PetscReal iter_norm)
 {
@@ -78,9 +147,45 @@ PETSC_INTERN PetscErrorCode KSPGMSTABSnapshot_Private(KSP ksp, KSP_GMSTAB *gms,
     PetscCall(VecDuplicate(b, &r_true));
     Mat Amat;
     PetscCall(KSPGetOperators(ksp, &Amat, NULL));
-    PetscCall(MatMult(Amat, x_total, Ax));
+
+    /* Phase 4a: for PC_RIGHT, x_total is the algorithm-internal x_alg,
+       not the user-visible x_user. To compute the *correct* true residual
+       ||b - A·x_user|| (the user always wants the unpreconditioned residual
+       of the original problem), unwrap x_total → x_user before MatMult.
+       The unwrap algebra mirrors FinalizeSolution_Private:
+           x_user = x_initial + B⁻¹·(x_total − x_initial)
+
+       For PC_NONE / PC_LEFT, x_total IS x_user, so MatMult(A, x_total)
+       is the right thing — same as the original code. The conditional
+       below short-circuits the extra PCApply on those paths. */
+    Vec x_for_mult = x_total;
+    Vec x_unwrap   = NULL;       /* freed at end iff we allocated it */
+    if (ksp->pc_side == PC_RIGHT || ksp->pc_side == PC_SYMMETRIC) {
+      PetscCheck(gms->x_initial_guess, PetscObjectComm((PetscObject)ksp), PETSC_ERR_PLIB,
+                 "KSPGMSTABSnapshot_Private: pc_side=%d but gms->x_initial_guess is NULL — "
+                 "the solve-start initial-guess save was skipped or destroyed prematurely",
+                 (int)ksp->pc_side);
+      Vec tmp;
+      PetscCall(VecDuplicate(b, &tmp));
+      PetscCall(VecDuplicate(b, &x_unwrap));
+      PetscCall(VecCopy(x_total, tmp));
+      PetscCall(VecAXPY(tmp, -1.0, gms->x_initial_guess));
+      /* tmp = x_total − x_initial = sum-of-xa-contributions in M-space. */
+      PC pc;
+      PetscCall(KSPGetPC(ksp, &pc));
+      PetscCall(PCApply(pc, tmp, x_unwrap));
+      /* x_unwrap = B⁻¹·(x_total − x_initial). */
+      PetscCall(VecAXPY(x_unwrap, 1.0, gms->x_initial_guess));
+      /* x_unwrap = x_user. */
+      PetscCall(VecDestroy(&tmp));
+      x_for_mult = x_unwrap;
+    }
+
+    PetscCall(MatMult(Amat, x_for_mult, Ax));
     PetscCall(VecWAXPY(r_true, -1.0, Ax, b));
     PetscCall(VecNorm(r_true, NORM_2, &norm_true));
+
+    if (x_unwrap) PetscCall(VecDestroy(&x_unwrap));
     PetscCall(VecDestroy(&Ax));
     PetscCall(VecDestroy(&r_true));
   }

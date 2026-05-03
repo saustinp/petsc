@@ -28,6 +28,11 @@ VALIDATORS=(
   "ex_gmstab_multisolve"            # KSPSolve called twice on same KSP — bit-identical x's
   "ex_gmstab_multisolve_rng"        # multi-solve via default-RNG shadow path (re-seed on every call)
   "ex_gmstab_schange"               # s changes between two KSPSolve calls (V0/V1/Z re-alloc at correct size)
+  "ex_gmstab_pcright_jacobi"        # Phase 4a: PC_RIGHT + Jacobi (zero initial guess)
+  "ex_gmstab_pcright_nzg"           # Phase 4a: PC_RIGHT + Jacobi + nonzero initial guess (x_initial save/restore)
+  "ex_gmstab_pcleft_jacobi"         # Phase 4b: PC_LEFT + Jacobi
+  "ex_gmstab_pcleft_bjacobi"        # Phase 4b: PC_LEFT + BJacobi (skips n=8 stall)
+  "ex_gmstab_pc_sweep"              # Phase 4d: cross-product (pc_side, pc_type) sweep on cdr_small
 )
 
 # Parallel runs (same binaries, varies mpiexec -n).
@@ -81,7 +86,10 @@ parallel_total=0
 parallel_fails=0
 PARALLEL_VALIDATORS=(ex_gmstab_cycle1 ex_gmstab_cycle2 ex_gmstab_natural
                      ex_gmstab_natural_nzg ex_gmstab_determinism ex_gmstab_multisolve
-                     ex_gmstab_multisolve_rng ex_gmstab_schange)
+                     ex_gmstab_multisolve_rng ex_gmstab_schange
+                     ex_gmstab_pcright_jacobi ex_gmstab_pcright_nzg
+                     ex_gmstab_pcleft_jacobi ex_gmstab_pcleft_bjacobi
+                     ex_gmstab_pc_sweep)
 for v in "${PARALLEL_VALIDATORS[@]}"; do
   bin=/tmp/$v
   if [ ! -f "$bin" ]; then
