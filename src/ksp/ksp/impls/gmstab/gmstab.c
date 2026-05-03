@@ -993,16 +993,24 @@ PETSC_EXTERN PetscErrorCode KSPCreate_GMSTAB(KSP ksp)
 
   /* Supported PC sides x norm types.
      Priority: PC_RIGHT + UNPRECONDITIONED is the canonical / fastest path
-     because the algorithm tracks the true residual internally. */
-  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_UNPRECONDITIONED, PC_RIGHT,     3));
-  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_PRECONDITIONED,   PC_RIGHT,     2));
-  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_UNPRECONDITIONED, PC_LEFT,      2));
-  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_PRECONDITIONED,   PC_LEFT,      3));
-  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_PRECONDITIONED,   PC_SYMMETRIC, 2));
-  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_UNPRECONDITIONED, PC_SYMMETRIC, 1));
-  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_NONE,             PC_RIGHT,     1));
-  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_NONE,             PC_LEFT,      1));
-  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_NONE,             PC_SYMMETRIC, 1));
+     because the algorithm tracks the true residual internally.
+
+     PC_SYMMETRIC is intentionally NOT declared here. The helper code at
+     gmstab_helpers.c:68/163 currently treats PC_SYMMETRIC as a synonym for
+     PC_RIGHT (uses PCApply for the unwrap), but that's wrong for split
+     symmetric preconditioners B = B_L * B_R — the unwrap should apply
+     B_R⁻¹ via PCApplySymmetricRight. Until Phase 4c implements that
+     properly, we reject PC_SYMMETRIC at setup by not registering it; users
+     who set KSPSetPCSide(ksp, PC_SYMMETRIC) will get a clean PETSc error
+     ("KSPGMSTAB does not support that side / norm combination") instead of
+     a silent wrong-answer. Matches GMRES's convention for unsupported
+     sides. */
+  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_UNPRECONDITIONED, PC_RIGHT, 3));
+  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_PRECONDITIONED,   PC_RIGHT, 2));
+  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_UNPRECONDITIONED, PC_LEFT,  2));
+  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_PRECONDITIONED,   PC_LEFT,  3));
+  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_NONE,             PC_RIGHT, 1));
+  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_NONE,             PC_LEFT,  1));
 
   ksp->ops->setup          = KSPSetUp_GMSTAB;
   ksp->ops->solve          = KSPSolve_GMSTAB;
