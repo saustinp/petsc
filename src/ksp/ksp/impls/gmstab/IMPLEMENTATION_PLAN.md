@@ -45,7 +45,7 @@ identified by the comparison harness?"**
 | C++ port (~2233 LOC across 9 files) | `gmstab_cpp/` (`solver.cpp` 613 LOC, `modified_gmres.cpp` 343 LOC, `stab_coeffs.cpp` 101 LOC, `small_dense.cpp` 106 LOC, plus headers) | validated to ≤1e-10 vs MATLAB | line-by-line translation reference |
 | Bit-for-bit baselines | `gmstab_matlab/gmstab_handoff_package_validation/baselines/{cdr_small, sherman5, ocean, asic_320ks, torso1, cdr_sweep_small ×124}` | each test ships `linsys.bin` + `P.bin` (deterministic shadow space) + `residuals.csv` (MATLAB) + `cpp_residuals.csv` (C++) + `summary.txt` | primary verification fixture |
 | Validation summary template | `gmstab_handoff_package_validation/validation_summary.csv` | rolled-up C++-vs-MATLAB diff | format the PETSc port also emits |
-| 575+ config sweep harness | `idr_petsc_ginkgo_comparison/` (resilient wrapper, post-AMGX-fix) | working | Phase 6/7 production target |
+| 575+ config sweep harness | `petsc_idr_integration/` (formerly `idr_petsc_ginkgo_comparison/`; resilient wrapper, post-AMGX-fix) | working | Phase 6/7 production target |
 
 The single decisive fact: the C++ port and MATLAB reference *already agree
 to ≤1e-10 absolute drift on `iterres` on every baseline*. Phase 5a's
