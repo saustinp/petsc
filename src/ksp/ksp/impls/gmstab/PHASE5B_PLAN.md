@@ -72,7 +72,11 @@ This is also the reason Phase 4c's choice of "PC_SYMMETRIC reports `‖B_L⁻¹�
 | left | 43.6 | `‖M⁻¹·b‖` (preconditioning amplifies) |
 | split | 328.0 | `‖L⁻¹·b‖` (left factor alone amplifies more) |
 
-**⚠️ Constructor-snapshot convention mismatch:** PETSc's gmstab currently emits `iterres = ‖b‖` at the constructor snapshot regardless of mode (`gmstab.c:215`). MATLAB emits the mode-specific norm. The iter=0 row will diverge — **this is a known artifact, not a bug**. The harness must skip iter=0 in the row-by-row diff, or apply a mode-specific iter=0 expected-value override. See §5.5 below.
+**⚠️ Constructor-snapshot convention mismatch:** PETSc's gmstab currently emits `iterres = ‖b‖` at the constructor snapshot regardless of mode (`gmstab.c:215`). MATLAB emits the mode-specific norm. The iter=0 row will diverge — **this is a known port-faithfulness gap, tracked as task #71 (Phase 4 follow-up)**. The Phase 5b harness skips iter=0 in the row-by-row diff (see §5.5).
+
+The proper fix (deferred to task #71) is to reorder the bLocal preconditioning to happen *before* the constructor snapshot so iter=0 reports `‖B⁻¹·b‖` (left), `‖L⁻¹·b‖` (split), or `‖b‖` (right/none) per mode. This requires careful re-validation of Phase 5a bit-equivalence since the constructor snapshot's value enters `KSPConvergedDefault`'s rnorm0 initialization.
+
+**Single-rank assertion:** Phase 5b is single-rank only. The custom CSR triangular solves in the PCSHELL are sequential by design (forward sweep has row-to-row data dependencies). The harness binary asserts `size == 1` at startup and errors out under `mpiexec`. Multi-rank PCSHELL with parallelizable triangular solve is tracked as task #72 (Phase 5c, future).
 
 ---
 
@@ -372,7 +376,7 @@ New columns vs. Phase 5a:
 
 **b_pre sanity:** harness aborts with HARNESS_ERR if `‖our_PCApply(b) − matlab_b_pre‖ > 1e-12`. This isn't a tier — it's a hard precondition for the comparison to be meaningful at all.
 
-**Universal residual sanity:** if the universal residual disagrees with summary.txt by more than `1e-6`, **flag in note**. Doesn't auto-fail (could be FP noise on hard-stagnation cases) but warrants investigation.
+**Universal residual sanity:** if the universal residual disagrees with summary.txt by more than `1e-8`, **flag in note**. Doesn't auto-fail (could be FP noise on hard-stagnation cases) but warrants investigation. Threshold tightened from initial 1e-6 per Sam's review; willing to workshop after results land.
 
 **OVERALL_PASS:** `residual_tier ∈ {PASS, PASS_DRIFT}` AND `matvec_tier ∈ {PASS_MV, NA_MV}` AND `b_pre_drift ≤ 1e-12` AND universal_res sanity OK (or noted).
 
