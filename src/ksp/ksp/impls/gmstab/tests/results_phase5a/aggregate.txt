@@ -1,0 +1,10 @@
+Phase 5a aggregate results
+Generated: Sun May  3 03:49:03 PM EDT 2026
+
+Total baselines:    129
+OVERALL_PASS:       129
+OVERALL_FAIL:       0
+HARNESS_ERR:        0
+bnorm warnings:     0
+
+Overall verdict: PHASE 5A PASS

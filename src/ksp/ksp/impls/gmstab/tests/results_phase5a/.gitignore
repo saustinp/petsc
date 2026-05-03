@@ -1,0 +1,4 @@
+# Per-baseline logs are stderr captures; regenerable from the harness binary.
+# Only the aggregate summary and per-baseline trace CSVs are version-controlled
+# artifacts.
+logs/
