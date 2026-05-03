@@ -83,6 +83,12 @@ iteration:
   `PC_LEFT` + `KSP_NORM_PRECONDITIONED`. The C++ reference operates in this algebra
   natively, so this gives bit-equivalent traces.
 
+> **⚠️ DO NOT USE — `PC_SYMMETRIC` + `PCILU`.** Errors at runtime due to a PETSc-wide gap
+> in the AIJ factor-matrix op table. Also affects `PC_SYMMETRIC` + `PCBJACOBI` with the
+> default sub-PC (which is PCILU). Workarounds: `-sub_pc_type jacobi` for PCBJACOBI, or
+> switch to `PC_LEFT` / `PC_RIGHT` for PCILU. See §8 ("Known limitations") for the
+> technical mechanism and a complete per-PC `PC_SYMMETRIC` support matrix.
+
 ---
 
 ## 3. Warning — `PC_LEFT` + `KSP_NORM_UNPRECONDITIONED` cost and stall
@@ -260,18 +266,66 @@ case documented above). Use the natural pairing.
 
 | PC type | `PC_SYMMETRIC` support |
 |---|---|
-| `PCJACOBI` | Works — symmetric square-root split, `B_L = B_R = sqrt(diag(A))` |
-| `PCICC` | Works (SPD-only) |
-| `PCCHOLESKY` | Works (SPD-only) |
-| `PCBJACOBI` | Works **iff** sub-PC supports symmetric apply. Default sub-PC is `KSPPREONLY+PCILU`; PCILU's symmetric path is broken (see below). Use `-sub_pc_type jacobi` to make this work. |
-| `PCSHELL` | Works (user provides `applysymmetricleft/right`) |
+| `PCJACOBI` | ✅ Works — symmetric square-root split, `B_L = B_R = sqrt(diag(A))` |
+| `PCICC` | ✅ Works (SPD-only) |
+| `PCCHOLESKY` | ✅ Works (SPD-only) |
+| `PCBJACOBI` w/ `-sub_pc_type jacobi` | ✅ Works — each block uses PCJACOBI |
+| `PCSHELL` | ✅ Works — user provides `applysymmetricleft/right` |
 | `PCMAT`, `PCBDDC`, `PCNN`, `PCLMVM`, `PCTFS`, `PCPBJACOBI`, `PCVPBJACOBI` | Implement `applysymmetricleft/right` per source; not exercised by gmstab tests |
-| `PCILU` | **PETSc-internal limitation:** `PCApplySymmetricLeft_ILU` calls `MatForwardSolve` which errors with "No method forwardsolve for Mat of type seqaij". The factored-matrix forwardsolve op isn't being attached for the symmetric path. Avoid until PETSc fixes this; use `PC_RIGHT` + `PCILU` instead. |
-| `PCSOR`, `PCASM`, `PCGAMG`, `PCHYPRE` | Don't implement `applysymmetricleft/right`. PETSc errors at the dispatch layer. Use `PC_LEFT` or `PC_RIGHT`. |
+| `PCILU` | ❌ **Errors** — see §8.x "PCILU + PC_SYMMETRIC" below |
+| `PCBJACOBI` with default sub-PC (PCILU) | ❌ **Errors** — cascades through to PCILU |
+| `PCSOR`, `PCASM`, `PCGAMG`, `PCHYPRE` | ❌ **Errors** — don't implement `applysymmetricleft/right` |
 
 Validated under cdr_small: `PC_SYMMETRIC + PCJACOBI` and
 `PC_SYMMETRIC + PCBJACOBI(-sub_pc_type jacobi)` at n=1/2/4/8 ranks. See
 `tests/ex_gmstab_pcsymmetric_sweep.c`.
+
+### `PC_SYMMETRIC` + `PCILU` (and `PCBJACOBI` with default sub-PC) — known PETSc bug
+
+**Symptom:** `KSPSolve` errors with
+```
+[0]PETSC ERROR: No method forwardsolve for Mat of type seqaij
+[0]PETSC ERROR: #1 MatForwardSolve() at .../matrix.c:4019
+[0]PETSC ERROR: #2 PCApplySymmetricLeft_ILU() at .../ilu.c:233
+```
+
+**Root cause** (PETSc-wide, not gmstab-specific):
+
+1. `PCApplySymmetricLeft_ILU` (`ilu.c:228-235`) calls `MatForwardSolve` on the factored
+   matrix, intending to apply only the `L` factor of `B = L·U`.
+
+2. `MatForwardSolve` (`matrix.c:4002`) dispatches to the matrix type's `forwardsolve`
+   op via `PetscUseTypeMethod(mat, forwardsolve, b, x)`.
+
+3. `forwardsolve` is registered **only on SBAIJ (Cholesky) factor types** in
+   `src/mat/impls/sbaij/seq/`. For LU factorization (`A = L·U`), the AIJ factor type
+   has `MatSolve` (combined `L·U·x = b` solve) registered but **not** `forwardsolve`
+   or `backwardsolve` — the half-step versions don't exist for AIJ factors.
+
+4. PCILU was written assuming AIJ factors would have `forwardsolve`/`backwardsolve`
+   like SBAIJ does. They don't. Latent bug, rarely exercised because most users pair
+   `PC_LEFT` or `PC_RIGHT` with `PCILU`, not `PC_SYMMETRIC`.
+
+5. `PCBJACOBI`'s `PCApplySymmetricLeft_BJacobi_*` delegates to the sub-PC's symmetric
+   apply. Default sub-PC is `KSPPREONLY + PCILU`, so it hits the same wall on each block.
+
+**`PCICC` + `PC_SYMMETRIC` works** because Cholesky factorization produces SBAIJ output,
+and SBAIJ factor types do have `forwardsolve`/`backwardsolve` registered. But ICC
+requires SPD problems.
+
+**Workarounds:**
+- For `PCBJACOBI`: set `-sub_pc_type jacobi` (or programmatically configure the sub-PC
+  to PCJACOBI). PCJACOBI's symmetric apply uses `1/sqrt(diag(A))` directly, no
+  triangular-solve dispatch needed.
+- For direct `PCILU`: switch to `PC_LEFT` or `PC_RIGHT`. ILU works fine in both.
+
+**Upstream fix** would be one of:
+1. Register `forwardsolve`/`backwardsolve` on AIJ factor types (mechanically straightforward).
+2. Make `PCApplySymmetricLeft_ILU` fall back to `PCApply`-and-multiply if `MatForwardSolve` errors.
+3. Drop `applysymmetricleft/right` from PCILU (explicit "not supported" instead of latent break).
+
+We plan to file a PETSc upstream issue for this. Until then, treat the table above as
+authoritative and avoid the ❌ rows.
 
 ### MATLAB split-precond baselines (Phase 5a forecast)
 
