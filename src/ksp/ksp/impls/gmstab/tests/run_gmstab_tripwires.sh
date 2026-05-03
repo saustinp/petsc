@@ -94,5 +94,54 @@ done
 
 echo ""
 echo "[tripwires] parallel summary: $((parallel_total - parallel_fails))/$parallel_total passed (ranks: ${PARALLEL_RANKS[*]})"
-echo "[tripwires] OVERALL: $((total + parallel_total - fail_count - parallel_fails))/$((total + parallel_total)) passed"
-exit $((fail_count + parallel_fails))
+
+# ---- Sequential vs parallel intermediate-dump cross-check ----
+# This catches bugs where seq and parallel code paths drift apart at
+# the per-checkpoint level even when the per-snapshot residual trace
+# happens to agree (e.g., a cancellation that masks an intermediate
+# divergence). Both seq and parallel PETSc use the same LAPACK calls
+# (so no gauge difference between runs), so EVERY checkpoint should
+# match modulo MPI Allreduce reordering rounding.
+xfails=0
+xtotal=0
+DIFF_TOOL="$TESTS/diff_seq_vs_parallel.py"
+SEQ_PAR_VALIDATORS=(ex_gmstab_cycle1 ex_gmstab_cycle2)
+SEQ_PAR_RANKS=(2 4)
+# Per-validator skip lists: V0_postBGS in cycle 1 is the documented
+# rank-deficiency-noise unit-vector that won't bit-match across rank
+# counts (see PHASE3_STATUS.md "V0_postBGS rank-deficiency noise").
+declare -A SKIP_FOR
+SKIP_FOR[ex_gmstab_cycle1]="chk04_V0_postBGS"
+SKIP_FOR[ex_gmstab_cycle2]=""
+for v in "${SEQ_PAR_VALIDATORS[@]}"; do
+  bin=/tmp/$v
+  if [ ! -f "$bin" ]; then continue; fi
+  # Run seq dump.
+  seq_dir=/tmp/${v}_seq_dump
+  rm -rf "$seq_dir"; mkdir -p "$seq_dir"
+  GMSTAB_DUMP_DIR="$seq_dir" "$bin" >/dev/null 2>&1 || true
+  skip_arg=""
+  if [ -n "${SKIP_FOR[$v]:-}" ]; then
+    skip_arg="--skip ${SKIP_FOR[$v]}"
+  fi
+  for n in "${SEQ_PAR_RANKS[@]}"; do
+    par_dir=/tmp/${v}_p${n}_dump
+    rm -rf "$par_dir"; mkdir -p "$par_dir"
+    xtotal=$((xtotal + 1))
+    GMSTAB_DUMP_DIR="$par_dir" "$MPIEXEC" -n "$n" "$bin" >/dev/null 2>&1 || true
+    echo "[tripwires] seq-vs-${n}rank dump diff for $v..."
+    if python3 "$DIFF_TOOL" "$seq_dir" "$par_dir" $skip_arg >"/tmp/${v}_seq_p${n}.diff.log" 2>&1; then
+      worst=$(tail -1 "/tmp/${v}_seq_p${n}.diff.log" | grep -oP 'worst=\S+')
+      echo "[tripwires] seq-vs-${n}rank ($v): PASS  ($worst)"
+    else
+      echo "[tripwires] seq-vs-${n}rank ($v): FAIL — see /tmp/${v}_seq_p${n}.diff.log"
+      tail -10 "/tmp/${v}_seq_p${n}.diff.log" | sed 's/^/[tripwires]   /'
+      xfails=$((xfails + 1))
+    fi
+  done
+done
+
+echo ""
+echo "[tripwires] seq-vs-parallel cross-check: $((xtotal - xfails))/$xtotal passed"
+echo "[tripwires] OVERALL: $((total + parallel_total + xtotal - fail_count - parallel_fails - xfails))/$((total + parallel_total + xtotal)) passed"
+exit $((fail_count + parallel_fails + xfails))

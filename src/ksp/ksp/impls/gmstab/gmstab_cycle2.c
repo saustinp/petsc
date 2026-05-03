@@ -581,6 +581,17 @@ PETSC_INTERN PetscErrorCode KSPGMSTABCycle2_Private(KSP ksp, KSP_GMSTAB *gms,
                                    H0, twos_p1, Qy, rank_y, 0.0, H0t_Qyt, twos));
   PetscScalar *Qg;
   const PetscInt Qg_cols = twos - rank_y;   /* expected = s when rank_y = s */
+  /* The downstream algebra (lq, V0/V1 update, Z assignment) is sized for
+     Qg_cols == s. If Y is rank-deficient (rank_y < s), Qg_cols > s and
+     we'd overrun fixed-size buffers. Y is the projection P^T*W of the
+     parallel Krylov basis through the shadow space; for a non-degenerate
+     P and well-conditioned A it is full-rank by construction. Fail
+     loudly if that assumption breaks. */
+  PetscCheck(Qg_cols == s, PetscObjectComm((PetscObject)ksp), PETSC_ERR_SUP,
+             "KSPGMSTABCycle2_Private: nullbasis(H0' Qy') has %" PetscInt_FMT
+             " columns, expected s=%" PetscInt_FMT ". This means Y was rank-deficient "
+             "(rank_y=%" PetscInt_FMT " instead of s). Cycle 2 cannot proceed.",
+             Qg_cols, s, rank_y);
   PetscCall(PetscMalloc1((size_t)twos * (size_t)Qg_cols, &Qg));
   PetscCall(KSPGMSTABNullBasis_Private(H0t_Qyt, twos, twos, rank_y, Qg, twos));
 
