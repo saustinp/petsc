@@ -33,6 +33,7 @@ VALIDATORS=(
   "ex_gmstab_pcleft_jacobi"         # Phase 4b: PC_LEFT + Jacobi
   "ex_gmstab_pcleft_bjacobi"        # Phase 4b: PC_LEFT + BJacobi (skips n=8 stall)
   "ex_gmstab_pc_sweep"              # Phase 4d: cross-product (pc_side, pc_type) sweep on cdr_small
+  "ex_gmstab_pc_multisolve"         # Phase 4 audit: 3 multi-solve scenarios with PC_RIGHT and pc_side switch
 )
 
 # Parallel runs (same binaries, varies mpiexec -n).
@@ -89,7 +90,7 @@ PARALLEL_VALIDATORS=(ex_gmstab_cycle1 ex_gmstab_cycle2 ex_gmstab_natural
                      ex_gmstab_multisolve_rng ex_gmstab_schange
                      ex_gmstab_pcright_jacobi ex_gmstab_pcright_nzg
                      ex_gmstab_pcleft_jacobi ex_gmstab_pcleft_bjacobi
-                     ex_gmstab_pc_sweep)
+                     ex_gmstab_pc_sweep ex_gmstab_pc_multisolve)
 for v in "${PARALLEL_VALIDATORS[@]}"; do
   bin=/tmp/$v
   if [ ! -f "$bin" ]; then

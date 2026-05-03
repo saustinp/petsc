@@ -393,28 +393,13 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
      tripwire caught the regression before this fix). The right safety
      net is `if (ksp->reason && reason != ITERATING) break`, which fires
      uniformly across all PC sides. */
-  /* Defensive runaway-iteration cap (Phase 4b). On some PC_LEFT +
-     poorly-conditioned-PC combinations we observed iteration counts
-     reaching millions of snapshots before a numerical event terminated
-     the solve, indicating that KSPConvergedDefault's DIVERGED_ITS check
-     wasn't firing as expected for this KSP type. The cap below fires at
-     `100 * max_it` cycles, which for a typical max_it=2000 means 200K
-     cycles — comfortably above any well-conditioned solve's needs (the
-     PC_LEFT + Jacobi cdr_small case takes ~250 cycles), but bounded so
-     a stuck PC_LEFT + small-block-BJacobi cdr_small at n=8 exits
-     gracefully as DIVERGED_ITS instead of running unbounded. */
-  const PetscInt runaway_cycle_cap = 100 * (ksp->max_it > 0 ? ksp->max_it : 10000);
+  /* Phase 4 audit follow-up: the natural-flow loop is reason-driven.
+     Snapshot_Private now properly enforces ksp->max_it (sets DIVERGED_ITS
+     when ksp->its >= ksp->max_it; the standard PETSc convention that
+     KSPConvergedDefault does NOT do itself). Each cycle emits multiple
+     snapshots, so DIVERGED_ITS fires within a fraction-of-a-cycle of the
+     user's max_it threshold. No additional cycle-level cap needed. */
   while (!ksp->reason || ksp->reason == KSP_CONVERGED_ITERATING) {
-    if (gms->cycle_count >= runaway_cycle_cap) {
-      ksp->reason = KSP_DIVERGED_ITS;
-      PetscCall(PetscInfo(ksp,
-        "KSPSolve_GMSTAB: runaway-iteration cap fired at cycle_count=%" PetscInt_FMT
-        " (cap = 100 * max_it = %" PetscInt_FMT "). KSPConvergedDefault did not "
-        "set a converged reason in time; signalling DIVERGED_ITS.\n",
-        gms->cycle_count, runaway_cycle_cap));
-      break;
-    }
-
     PetscBool t_restart = PETSC_FALSE, t_replace = PETSC_FALSE;
     if (beta_curr < gms->c_restart * gms->beta_local) {
       t_restart = PETSC_TRUE;

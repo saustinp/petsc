@@ -224,6 +224,18 @@ PETSC_INTERN PetscErrorCode KSPGMSTABSnapshot_Private(KSP ksp, KSP_GMSTAB *gms,
   PetscCall(KSPLogResidualHistory(ksp, rnorm_for_check));
   PetscCall(KSPMonitor(ksp, ksp->its, rnorm_for_check));
   PetscCall((*ksp->converged)(ksp, ksp->its, rnorm_for_check, &ksp->reason, ksp->cnvP));
+
+  /* KSPConvergedDefault does NOT set KSP_DIVERGED_ITS — by PETSc convention
+     that's the KSP type's own responsibility (cf. gmres.c:187). Snapshot_Private
+     is where ksp->its is updated and where (*ksp->converged) is called, so it's
+     the natural place to enforce the max_it bound: if KSPConvergedDefault left
+     reason as ITERATING but we've already reached max_it, the solve is diverging
+     and we should signal it. The convergence callbacks (ATOL/RTOL/DTOL) check
+     first inside KSPConvergedDefault, so this check fires only when no
+     convergence reason was raised. */
+  if (ksp->reason == KSP_CONVERGED_ITERATING && ksp->max_it > 0 && ksp->its >= ksp->max_it) {
+    ksp->reason = KSP_DIVERGED_ITS;
+  }
   PetscFunctionReturn(PETSC_SUCCESS);
 }
 
