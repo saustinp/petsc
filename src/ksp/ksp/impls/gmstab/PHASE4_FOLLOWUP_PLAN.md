@@ -518,6 +518,37 @@ Acted on immediately (not deferred to this follow-up patch):
 
 ---
 
+## 7.7. Phase 5a harness design (decided 2026-05-03)
+
+This isn't part of the Phase 4 follow-up patch but it's a Phase-4-adjacent decision
+worth recording here so the cold-start checklist at §6 picks it up:
+
+**Phase 5a will use the natural-mapping harness:** map MATLAB `A_fun` patterns 1:1 to
+PETSc PC sides:
+
+| MATLAB `A_fun(v)` | PETSc `KSPSetPCSide` |
+|---|---|
+| `A*v`             | `PC_NONE` |
+| `M\(A*v)`         | `PC_LEFT` |
+| `A*(M\v)`         | `PC_RIGHT` |
+| `L\(A*(R\v))`     | `PC_SYMMETRIC` |
+
+Rationale: most faithful to test data, structurally correct, and exercises all three PC
+sides (left/right/split). Avoids the trap of collapsing split precond into a combined
+`B = L*R` and routing through `PC_LEFT`, which would skip the `PC_SYMMETRIC` dispatch
+entirely and let bugs like the wave-1 silent-wrong-answer hide in production.
+
+**Sequencing implication:** Phase 5a's split-precond baselines (Sandia_ASIC320ks,
+Norris_torso1, Ocean, etc. — ~30–50 of 129) cannot run until **Phase 4c (PC_SYMMETRIC
+support, task #69)** is complete. Phase 5a can start on the unprec/left/right subset
+(~80–90 baselines) while 4c is in flight, but the full sweep gates on 4c landing.
+
+Phase 4c work is tracked separately as task #69 with a detailed implementation list
+(re-add registration, add `PCApplySymmetricRight` dispatch in helpers, replace the
+rejection tripwire with a positive correctness test).
+
+---
+
 ## 8. Out-of-scope (do not bundle)
 
 - **PC_SYMMETRIC support / Phase 4c** — separate concern, separate plan.
