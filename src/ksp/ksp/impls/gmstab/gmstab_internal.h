@@ -79,14 +79,18 @@ PETSC_INTERN PetscErrorCode KSPGMSTABSnapshotLocal_Private(KSP ksp, KSP_GMSTAB *
      pc_side = PC_NONE  or PC_LEFT   →  x_local := x_global + x_local
      pc_side = PC_RIGHT              →  x_local := x_initial_guess + B⁻¹ ·
                                                   (x_global + x_local − x_initial_guess)
-     pc_side = PC_SYMMETRIC          →  REJECTED at solve start (Phase 4 final-audit
-                                        defense-in-depth). The Phase 4c plan is to
-                                        unwrap via PCApplySymmetricRight (only the
-                                        right factor B_R⁻¹), which differs from the
-                                        full PCApply that PC_RIGHT uses. Until that's
-                                        implemented, KSPSolve_GMSTAB errors with
-                                        PETSC_ERR_SUP rather than silently producing
-                                        a wrong x_user.
+     pc_side = PC_SYMMETRIC          →  x_local := x_initial_guess + B_R⁻¹ ·
+                                                    (x_global + x_local − x_initial_guess)
+                                        via PCApplySymmetricRight (Phase 4c). Only the
+                                        right factor B_R⁻¹ is applied — not full PCApply
+                                        which would be (B_L·B_R)⁻¹ in symmetric splits
+                                        and produce wrong x_user. Algorithm pre-applies
+                                        B_L⁻¹ to bLocal once at solve start; symmetry
+                                        of the algebra means finalize undoes only the
+                                        right factor. Requires the user's PC type to
+                                        implement applysymmetricright (PCJACOBI,
+                                        PCICC, PCBJACOBI(with right sub-PC), etc.;
+                                        not PCSOR/PCASM/PCGAMG/PCHYPRE).
 
    Must be called from EVERY return path in KSPSolve_GMSTAB that returns
    AFTER `VecSet(x_local, 0.0)` has zeroed the initial guess in x_local.

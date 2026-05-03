@@ -36,21 +36,24 @@ PETSC_INTERN PetscErrorCode KSPGMSTABSnapshotLocal_Private(KSP ksp, KSP_GMSTAB *
 }
 
 /* ============================================================================
- * KSPGMSTABFinalizeSolution_Private (Phase 4a)
+ * KSPGMSTABFinalizeSolution_Private (Phase 4a/4c)
  *
  *   Finalize x_local to the user-visible solution before KSPSolve_GMSTAB
  *   returns. Subsumes the per-return-path "x_local += x_global"
  *   accumulation that Phase 3d's audit established for PC_NONE / PC_LEFT,
- *   and adds the right-preconditioning unwrap for PC_RIGHT.
+ *   and adds the per-side unwrap for PC_RIGHT and PC_SYMMETRIC.
  *
- *   Algebra:
- *     PC_NONE / PC_LEFT:  x_user = x_global + x_local       (unchanged)
- *     PC_RIGHT:           x_user = x_initial + B⁻¹ · (x_global + x_local
- *                                                       − x_initial)
- *     PC_SYMMETRIC:       NOT REACHABLE — rejected at solve start. Phase 4c
- *                         will implement properly via PCApplySymmetricRight
- *                         (only the right factor B_R⁻¹ should be applied;
- *                         using full PCApply is wrong for split-symmetric PCs).
+ *   Algebra (Σ_xa := x_global + x_local − x_initial):
+ *     PC_NONE / PC_LEFT:  x_user = x_global + x_local           (no unwrap)
+ *     PC_RIGHT:           x_user = x_initial + B⁻¹ · Σ_xa       (PCApply)
+ *     PC_SYMMETRIC:       x_user = x_initial + B_R⁻¹ · Σ_xa     (PCApplySymmetricRight)
+ *
+ *   The PC_SYMMETRIC unwrap applies only the RIGHT factor B_R⁻¹ — NOT the
+ *   full PCApply (which would be (B_L·B_R)⁻¹ = the combined preconditioner
+ *   solve, wrong for split-symmetric algebra). The symmetry of the algorithm
+ *   is: bLocal preconditioned by B_L⁻¹ at solve start (gmstab.c bLocal
+ *   block); cycle operates on M = B_L⁻¹·A·B_R⁻¹; finalize undoes the right
+ *   factor only.
  *
  *   Idempotency: callers must only call this once per solve and must
  *   NOT VecAXPY x_global into x_local separately. The legacy inline
@@ -60,6 +63,11 @@ PETSC_INTERN PetscErrorCode KSPGMSTABSnapshotLocal_Private(KSP ksp, KSP_GMSTAB *
  *   Pattern-B safety (multi-path invariant violation): one helper, called
  *   uniformly by every exit, ensures the post-condition "x_local = x_user"
  *   holds regardless of which return path fired.
+ *
+ *   Pattern-D safety (snapshot rhythm divergence): this helper and the
+ *   unwrap branch in Snapshot_Private MUST use the same per-side dispatch
+ *   so the user-visible x and the snapshot-reported norm_true correspond
+ *   to the same vector. If they diverge, g_self in the PC tripwires fails.
  * ============================================================================ */
 PETSC_INTERN PetscErrorCode KSPGMSTABFinalizeSolution_Private(KSP ksp, KSP_GMSTAB *gms,
                                                                Vec x_local)
@@ -68,19 +76,10 @@ PETSC_INTERN PetscErrorCode KSPGMSTABFinalizeSolution_Private(KSP ksp, KSP_GMSTA
   PCSide pc_side;
   PetscCall(KSPGetPCSide(ksp, &pc_side));
 
-  /* Defense-in-depth: PC_SYMMETRIC is rejected at solve start (see
-     KSPSolve_GMSTAB top-of-function check); if we reach here with
-     PC_SYMMETRIC something has gone wrong. The PCApply on the next branch
-     would silently produce a wrong unwrap for split-symmetric PCs. */
-  PetscCheck(pc_side != PC_SYMMETRIC, PetscObjectComm((PetscObject)ksp), PETSC_ERR_PLIB,
-             "KSPGMSTABFinalizeSolution_Private: PC_SYMMETRIC reached past the "
-             "solve-start guard. Phase 4c not yet implemented.");
-
-  if (pc_side == PC_RIGHT) {
-    /* Right preconditioning:
-       x_user = x_initial + B⁻¹ · (x_global + x_local − x_initial).
-       The Vec x_initial_guess MUST have been allocated at solve start
-       (gmstab.c does this conditionally on pc_side); if it's NULL here,
+  if (pc_side == PC_RIGHT || pc_side == PC_SYMMETRIC) {
+    /* Right or symmetric preconditioning. The Vec x_initial_guess MUST
+       have been allocated at solve start (gmstab.c does this conditionally
+       on pc_side ∈ {PC_RIGHT, PC_SYMMETRIC}); if it's NULL here,
        something has gone wrong upstream. */
     PetscCheck(gms->x_initial_guess, PetscObjectComm((PetscObject)ksp), PETSC_ERR_PLIB,
                "KSPGMSTABFinalizeSolution_Private: pc_side=%d but gms->x_initial_guess is NULL — "
@@ -96,14 +95,25 @@ PETSC_INTERN PetscErrorCode KSPGMSTABFinalizeSolution_Private(KSP ksp, KSP_GMSTA
     PetscCall(VecCopy(gms->x_global, gms->work_n));
     PetscCall(VecAXPY(gms->work_n, 1.0, x_local));
     PetscCall(VecAXPY(gms->work_n, -1.0, gms->x_initial_guess));
-    /* gms->work_n now holds (x_global + x_local − x_initial). */
+    /* gms->work_n now holds Σ_xa = (x_global + x_local − x_initial). */
 
-    /* Apply B⁻¹ to Σ_xa, writing the result back into x_local. PCApply
-       handles parallel layouts and any matrix-free PC correctly. */
+    /* Apply the appropriate inverse:
+         PC_RIGHT     -> PCApply (full B⁻¹)
+         PC_SYMMETRIC -> PCApplySymmetricRight (B_R⁻¹ only) */
     PC pc;
     PetscCall(KSPGetPC(ksp, &pc));
-    PetscCall(PCApply(pc, gms->work_n, x_local));
-    /* x_local now holds B⁻¹ · Σ_xa. */
+    if (pc_side == PC_RIGHT) {
+      PetscCall(PCApply(pc, gms->work_n, x_local));
+    } else {
+      /* PC_SYMMETRIC: PCApplySymmetricRight requires the source PC to
+         implement applysymmetricright. Among standard PETSc PCs, this
+         includes PCJACOBI, PCICC, PCILU, PCCHOLESKY, PCBJACOBI (delegates
+         to sub-PC), PCSHELL, PCMAT, PCBDDC, PCNN, etc. PCSOR / PCASM /
+         PCGAMG / PCHYPRE error here with PETSC_ERR_SUP — that's a
+         user-facing PETSc limitation, not a gmstab bug. */
+      PetscCall(PCApplySymmetricRight(pc, gms->work_n, x_local));
+    }
+    /* x_local now holds B_eff⁻¹ · Σ_xa. */
 
     /* Add x_initial back to recover x_user. */
     PetscCall(VecAXPY(x_local, 1.0, gms->x_initial_guess));
@@ -159,25 +169,26 @@ PETSC_INTERN PetscErrorCode KSPGMSTABSnapshot_Private(KSP ksp, KSP_GMSTAB *gms,
     Mat Amat;
     PetscCall(KSPGetOperators(ksp, &Amat, NULL));
 
-    /* Phase 4a: for PC_RIGHT, x_total is the algorithm-internal x_alg,
-       not the user-visible x_user. To compute the *correct* true residual
-       ||b - A·x_user|| (the user always wants the unpreconditioned residual
-       of the original problem), unwrap x_total → x_user before MatMult.
-       The unwrap algebra mirrors FinalizeSolution_Private:
-           x_user = x_initial + B⁻¹·(x_total − x_initial)
+    /* Phase 4a/4c: for PC_RIGHT and PC_SYMMETRIC, x_total is the
+       algorithm-internal x_alg, not the user-visible x_user. To compute
+       the *correct* true residual ||b - A·x_user|| (the user always wants
+       the unpreconditioned residual of the original problem), unwrap
+       x_total → x_user before MatMult. The unwrap algebra mirrors
+       FinalizeSolution_Private:
+           PC_RIGHT     : x_user = x_initial + B⁻¹·(x_total − x_initial)
+           PC_SYMMETRIC : x_user = x_initial + B_R⁻¹·(x_total − x_initial)
 
        For PC_NONE / PC_LEFT, x_total IS x_user, so MatMult(A, x_total)
-       is the right thing — same as the original code. The conditional
-       below short-circuits the extra PCApply on those paths. */
+       is the right thing. The conditional below short-circuits the extra
+       PCApply* on those paths.
+
+       Pattern-D invariant: the dispatch here MUST match the dispatch in
+       FinalizeSolution_Private. If they diverge, the user gets a
+       different x than the algorithm reported a residual for, and g_self
+       in the PC tripwires fails. */
     Vec x_for_mult = x_total;
     Vec x_unwrap   = NULL;       /* freed at end iff we allocated it */
-    /* PC_SYMMETRIC defense-in-depth: rejected at solve start. If reached
-       here, the unwrap below would use full PCApply instead of the correct
-       PCApplySymmetricRight, silently producing wrong x_for_mult. */
-    PetscCheck(ksp->pc_side != PC_SYMMETRIC, PetscObjectComm((PetscObject)ksp), PETSC_ERR_PLIB,
-               "KSPGMSTABSnapshot_Private: PC_SYMMETRIC reached past the "
-               "solve-start guard. Phase 4c not yet implemented.");
-    if (ksp->pc_side == PC_RIGHT) {
+    if (ksp->pc_side == PC_RIGHT || ksp->pc_side == PC_SYMMETRIC) {
       PetscCheck(gms->x_initial_guess, PetscObjectComm((PetscObject)ksp), PETSC_ERR_PLIB,
                  "KSPGMSTABSnapshot_Private: pc_side=%d but gms->x_initial_guess is NULL — "
                  "the solve-start initial-guess save was skipped or destroyed prematurely",
@@ -190,8 +201,13 @@ PETSC_INTERN PetscErrorCode KSPGMSTABSnapshot_Private(KSP ksp, KSP_GMSTAB *gms,
       /* tmp = x_total − x_initial = sum-of-xa-contributions in M-space. */
       PC pc;
       PetscCall(KSPGetPC(ksp, &pc));
-      PetscCall(PCApply(pc, tmp, x_unwrap));
-      /* x_unwrap = B⁻¹·(x_total − x_initial). */
+      if (ksp->pc_side == PC_RIGHT) {
+        PetscCall(PCApply(pc, tmp, x_unwrap));
+      } else {
+        /* PC_SYMMETRIC: only the right factor B_R⁻¹. */
+        PetscCall(PCApplySymmetricRight(pc, tmp, x_unwrap));
+      }
+      /* x_unwrap = B_eff⁻¹·(x_total − x_initial). */
       PetscCall(VecAXPY(x_unwrap, 1.0, gms->x_initial_guess));
       /* x_unwrap = x_user. */
       PetscCall(VecDestroy(&tmp));

@@ -476,18 +476,41 @@ NORM_PRECONDITIONED and verifies the reported rnorm matches an externally-comput
 The final bug-fix audit pass before declaring Phase 4 done surfaced these items.
 Acted on immediately (not deferred to this follow-up patch):
 
-**Fixed in commit immediately following PHASE4_FOLLOWUP_PLAN draft:**
+**Fixed in wave 1 (commit 7cb3833bfb6) — registration drop:**
 
 - **PC_SYMMETRIC silent-wrong-answer (gmstab.c:1001-1005, gmstab_helpers.c:50/68/163,
   gmstab_internal.h:82).** PC_SYMMETRIC was registered as supported across three
   norm types but the helper code (FinalizeSolution_Private and Snapshot_Private's
   unwrap branch) treated it as PC_RIGHT — using full `PCApply(B⁻¹)` for the unwrap
   rather than `PCApplySymmetricRight(B_R⁻¹)` that split-symmetric PCs need. Silent
-  wrong-answer for any user setting PC_SYMMETRIC. **Fix: dropped PC_SYMMETRIC from
-  KSPSetSupportedNorm registration.** PETSc setup now rejects PC_SYMMETRIC at solve
-  time (matches GMRES convention). Helper-code branches at gmstab_helpers.c:68 and
-  :163 become unreachable — left in place with comments updated to reference
-  Phase 4c, not removed.
+  wrong-answer for any user setting PC_SYMMETRIC. **Wave 1 fix: dropped PC_SYMMETRIC
+  from KSPSetSupportedNorm registration**, so PETSc setup rejected it.
+
+**Resolved in Phase 4c (commit pending after this section) — proper implementation:**
+
+- PC_SYMMETRIC is now correctly supported with the algebra:
+  - `bLocal = PCApplySymmetricLeft(b - A·x_initial)` (B_L⁻¹ at solve start)
+  - cycle operates on `M = B_L⁻¹·A·B_R⁻¹` via `KSP_PCApplyBAorAB`
+    (PETSc handles this at `precon.c:842-848`)
+  - unwrap: `x_user = x_initial + PCApplySymmetricRight(x_alg − x_initial)`
+- Validated under cdr_small with `PCJACOBI` (symmetric sqrt split) and
+  `PCBJACOBI(sub_pc_type=jacobi)`. Both pass at n=1/2/4/8.
+- `KSP_NORM_PRECONDITIONED + PC_SYMMETRIC` declared with priority 2 (mirrors GMRES
+  convention). `KSP_NORM_UNPRECONDITIONED + PC_SYMMETRIC` intentionally NOT declared.
+- Wave-2 defense-in-depth (top-level PetscCheck and inner PetscChecks) removed —
+  no longer needed with proper implementation.
+- Tripwire `tests/ex_gmstab_pc_symmetric_rejected.c` replaced with
+  `tests/ex_gmstab_pcsymmetric_sweep.c` (positive correctness sweep).
+- See `USER_MANUAL.md §8` for the per-PC support matrix and known limitations.
+
+**PETSc-side limitation (not a gmstab issue) discovered during Phase 4c testing:**
+- `PCApplySymmetricLeft_ILU` at `ilu.c:233` calls `MatForwardSolve` on the SeqAIJ
+  matrix, which errors with "No method forwardsolve for Mat of type seqaij". This
+  is a bug or incomplete-feature in PETSc's `PCILU` symmetric-apply path — the
+  factored matrix's forwardsolve op isn't being attached correctly. Affects
+  `PC_SYMMETRIC + PCILU` and `PC_SYMMETRIC + PCBJACOBI` (with default ILU sub-PC).
+  Workaround: use `-sub_pc_type jacobi` for PCBJACOBI; for direct PCILU usage,
+  switch to `PC_LEFT` or `PC_RIGHT`. Documented in `USER_MANUAL.md §8`.
 
 **Documented but deferred (no action needed):**
 

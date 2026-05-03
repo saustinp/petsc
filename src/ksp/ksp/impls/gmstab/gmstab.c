@@ -70,25 +70,6 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
   KSP_GMSTAB *gms = (KSP_GMSTAB *)ksp->data;
   PetscFunctionBegin;
 
-  /* Phase 4 final-audit defense-in-depth: PC_SYMMETRIC is intentionally not
-     declared in KSPSetSupportedNorm (gmstab.c:993-1007), so PETSc's KSPSetUp
-     should reject it. Guard explicitly here in case (a) a future refactor
-     re-adds the registration without fixing the helper-code unwrap, (b) the
-     user changes pc_side via KSPSetPCSide between solves on a configured
-     KSP and that path bypasses re-validation. The helpers at
-     gmstab_helpers.c:FinalizeSolution_Private and Snapshot_Private currently
-     treat PC_SYMMETRIC as a synonym for PC_RIGHT, which uses full PCApply
-     instead of PCApplySymmetricRight — silently wrong for split-symmetric
-     PCs B = B_L * B_R. Phase 4c will implement properly; until then, error. */
-  {
-    PCSide pc_side_check;
-    PetscCall(KSPGetPCSide(ksp, &pc_side_check));
-    PetscCheck(pc_side_check != PC_SYMMETRIC, PetscObjectComm((PetscObject)ksp),
-               PETSC_ERR_SUP,
-               "KSPGMSTAB: PC_SYMMETRIC is not yet supported (Phase 4c). "
-               "Use PC_LEFT or PC_RIGHT.");
-  }
-
   /* Reset per-solve counters and state. */
   gms->snapshot_count             = 0;
   gms->matvec_count               = 0;
@@ -150,13 +131,14 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
      handle a user that changes s with KSPGMSTABSetS between solves —
      Initialisation re-allocates V0/V1/Z lazily on the first cycle.
 
-     gms->x_initial_guess (Phase 4a) is allocated/copied AFTER this destroy
-     block on a per-solve basis when pc_side == PC_RIGHT (PC_SYMMETRIC is
-     rejected at solve start; Phase 4c will re-enable it with the correct
-     PCApplySymmetricRight unwrap, at which point this conditional should be
-     extended). Destroying here means a previous solve in PC_RIGHT mode can't
-     leak stale state into a subsequent PC_NONE solve, and that the Vec is
-     fresh-from-b on each invocation regardless of pc_side history. */
+     gms->x_initial_guess (Phase 4a/4c) is allocated/copied AFTER this destroy
+     block on a per-solve basis when pc_side ∈ {PC_RIGHT, PC_SYMMETRIC} —
+     both of those modes need to recover x_user via an unwrap of the form
+     `x_user = x_initial + (B⁻¹ or B_R⁻¹)·(x_alg − x_initial)`. Destroying
+     here means a previous solve in a PC mode that allocated x_initial_guess
+     can't leak stale state into a subsequent solve in a different mode,
+     and that the Vec is fresh-from-b on each invocation regardless of
+     pc_side history. */
   PetscCall(VecDestroy(&gms->b_local));
   PetscCall(VecDestroy(&gms->x_global));
   PetscCall(VecDestroy(&gms->x_initial_guess));
@@ -175,24 +157,22 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
      KSPSetInitialGuessNonzero this is non-zero). */
   PetscCall(VecCopy(x_local, gms->x_global));
 
-  /* Phase 4a — for PC_RIGHT, save the user's initial guess in a dedicated
-     Vec. The algorithm internally tracks x_alg = x_global + x_local in the
-     M-space (where M = A·B⁻¹). At solve end the user-visible solution is
-     recovered as x_user = x_initial + B⁻¹·(x_alg − x_initial). Without this
-     save we can't recover x_user after the algorithm has accumulated
-     restart contributions into x_global.
+  /* Phase 4a/4c — for PC_RIGHT or PC_SYMMETRIC, save the user's initial
+     guess in a dedicated Vec. The algorithm internally tracks
+     x_alg = x_global + x_local in M-space (M = A·B⁻¹ for PC_RIGHT,
+     M = B_L⁻¹·A·B_R⁻¹ for PC_SYMMETRIC). At solve end the user-visible
+     solution is recovered as x_user = x_initial + B_eff⁻¹·(x_alg − x_initial),
+     where B_eff⁻¹ is PCApply for PC_RIGHT and PCApplySymmetricRight for
+     PC_SYMMETRIC. Without this save we can't recover x_user after the
+     algorithm has accumulated restart contributions into x_global.
 
      Done AFTER the per-solve VecDestroy block above (so a stale Vec from
      a prior solve is freed) and BEFORE the VecSet(x_local, 0.0) below
-     (so the initial guess is still readable from x_global / x_local).
-
-     PC_SYMMETRIC is rejected at the top of KSPSolve_GMSTAB (Phase 4 final
-     audit defense-in-depth); Phase 4c will extend this conditional and
-     route through PCApplySymmetricRight in the unwrap. */
+     (so the initial guess is still readable from x_global / x_local). */
   {
     PCSide pc_side_for_init;
     PetscCall(KSPGetPCSide(ksp, &pc_side_for_init));
-    if (pc_side_for_init == PC_RIGHT) {
+    if (pc_side_for_init == PC_RIGHT || pc_side_for_init == PC_SYMMETRIC) {
       PetscCall(VecDuplicate(b, &gms->x_initial_guess));
       PetscCall(VecCopy(gms->x_global, gms->x_initial_guess));
     }
@@ -249,29 +229,46 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
   PetscCall(VecWAXPY(gms->b_local, -1.0, Ax, b));
   PetscCall(VecDestroy(&Ax));
 
-  /* Phase 4b — for PC_LEFT we solve B⁻¹·A·x = B⁻¹·b. Convert bLocal to
-     its preconditioned form ONCE here; from this point on the algorithm
-     operates in B⁻¹·A's M-space and tracks r_pre = B⁻¹·(b − A·x_user).
-     The cycles already use KSP_PCApplyBAorAB which dispatches B⁻¹·A on
-     PC_LEFT, so r := bLocal_pre − M·x_local stays consistent with
-     B⁻¹·(b − A·x_user) throughout the solve.
+  /* Phase 4b/4c — for PC_LEFT and PC_SYMMETRIC, convert bLocal to its
+     preconditioned form ONCE here; from this point on the algorithm
+     operates in M-space and tracks the corresponding preconditioned
+     residual:
+       PC_LEFT       : M = B⁻¹·A,         r_pre = B⁻¹·(b − A·x_user)
+                       precond bLocal via PCApply (full B⁻¹).
+       PC_SYMMETRIC  : M = B_L⁻¹·A·B_R⁻¹, r_pre = B_L⁻¹·(b − A·x_user)
+                       precond bLocal via PCApplySymmetricLeft (B_L⁻¹ only).
+     The cycles already use KSP_PCApplyBAorAB which dispatches the correct
+     M·x_local for each side (PC_SYMMETRIC routes through
+     PCApplySymmetricRight then MatMult then PCApplySymmetricLeft per
+     precon.c:842-848). So r := bLocal_pre − M·x_local stays consistent
+     with the per-side preconditioned residual throughout the solve.
 
-     The PCApply is uncounted (it's PC setup-equivalent work, not an
+     The PCApply* is uncounted (it's PC setup-equivalent work, not an
      A-matvec). Done after bLocal is fully formed and before VecCopy
      into gms->r below.
 
-     For PC_NONE / PC_RIGHT this block is a no-op. PC_SYMMETRIC is
-     rejected at solve start; Phase 4c will define its bLocal preconditioning
-     when it lands. */
+     For PC_NONE / PC_RIGHT this block is a no-op (those modes track the
+     unpreconditioned residual natively). */
   {
     PCSide pc_side_for_blocal;
     PetscCall(KSPGetPCSide(ksp, &pc_side_for_blocal));
-    if (pc_side_for_blocal == PC_LEFT) {
+    if (pc_side_for_blocal == PC_LEFT || pc_side_for_blocal == PC_SYMMETRIC) {
       Vec b_pre;
       PetscCall(VecDuplicate(b, &b_pre));
       PC pc;
       PetscCall(KSPGetPC(ksp, &pc));
-      PetscCall(PCApply(pc, gms->b_local, b_pre));
+      if (pc_side_for_blocal == PC_LEFT) {
+        PetscCall(PCApply(pc, gms->b_local, b_pre));
+      } else {
+        /* PC_SYMMETRIC: apply B_L⁻¹ only via PCApplySymmetricLeft.
+           Errors at runtime if the user's PC type doesn't implement
+           applysymmetricleft (e.g., PCSOR/PCASM/PCGAMG). PETSc's
+           registration check at KSPSetUp accepts the (PC_SYMMETRIC,
+           NORM_PRECONDITIONED) combo for any PC, but only PCs in the
+           applysymmetric* list actually run — others surface a clear
+           PETSC_ERR_SUP from PETSc's PCApplySymmetricLeft. */
+        PetscCall(PCApplySymmetricLeft(pc, gms->b_local, b_pre));
+      }
       PetscCall(VecCopy(b_pre, gms->b_local));
       PetscCall(VecDestroy(&b_pre));
     }
@@ -1021,22 +1018,26 @@ PETSC_EXTERN PetscErrorCode KSPCreate_GMSTAB(KSP ksp)
      Priority: PC_RIGHT + UNPRECONDITIONED is the canonical / fastest path
      because the algorithm tracks the true residual internally.
 
-     PC_SYMMETRIC is intentionally NOT declared here. The helper code at
-     gmstab_helpers.c:68/163 currently treats PC_SYMMETRIC as a synonym for
-     PC_RIGHT (uses PCApply for the unwrap), but that's wrong for split
-     symmetric preconditioners B = B_L * B_R — the unwrap should apply
-     B_R⁻¹ via PCApplySymmetricRight. Until Phase 4c implements that
-     properly, we reject PC_SYMMETRIC at setup by not registering it; users
-     who set KSPSetPCSide(ksp, PC_SYMMETRIC) will get a clean PETSc error
-     ("KSPGMSTAB does not support that side / norm combination") instead of
-     a silent wrong-answer. Matches GMRES's convention for unsupported
-     sides. */
-  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_UNPRECONDITIONED, PC_RIGHT, 3));
-  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_PRECONDITIONED,   PC_RIGHT, 2));
-  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_UNPRECONDITIONED, PC_LEFT,  2));
-  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_PRECONDITIONED,   PC_LEFT,  3));
-  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_NONE,             PC_RIGHT, 1));
-  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_NONE,             PC_LEFT,  1));
+     PC_SYMMETRIC (Phase 4c): supported with PCs that implement
+     PCApplySymmetricLeft/Right (jacobi, icc, ilu, cholesky, bjacobi,
+     pbjacobi, vpbjacobi, shell, mat, lmvm, bddc, nn, tfs, none, plus
+     the ViennaCL GPU variants). PCSOR/PCASM/PCGAMG/PCHYPRE error from
+     PETSc's missing applysymmetricright. The unwrap algebra differs
+     from PC_RIGHT: under PC_SYMMETRIC we apply PCApplySymmetricRight
+     (only B_R⁻¹) at finalize and snapshot time, and PCApplySymmetricLeft
+     (only B_L⁻¹) once at solve start to precondition bLocal. The
+     declared norm type is PRECONDITIONED (algorithm tracks ||r_pre||
+     natively in M = B_L⁻¹·A·B_R⁻¹ space). UNPRECONDITIONED with
+     PC_SYMMETRIC is intentionally not declared — same reasoning as
+     gmres.c:884 (only NORM_PRECONDITIONED + PC_SYMMETRIC there). */
+  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_UNPRECONDITIONED, PC_RIGHT,     3));
+  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_PRECONDITIONED,   PC_RIGHT,     2));
+  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_UNPRECONDITIONED, PC_LEFT,      2));
+  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_PRECONDITIONED,   PC_LEFT,      3));
+  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_PRECONDITIONED,   PC_SYMMETRIC, 2));
+  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_NONE,             PC_RIGHT,     1));
+  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_NONE,             PC_LEFT,      1));
+  PetscCall(KSPSetSupportedNorm(ksp, KSP_NORM_NONE,             PC_SYMMETRIC, 1));
 
   ksp->ops->setup          = KSPSetUp_GMSTAB;
   ksp->ops->solve          = KSPSolve_GMSTAB;

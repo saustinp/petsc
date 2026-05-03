@@ -244,16 +244,42 @@ sub-blocks. `||r_pre||` can stall at ~7e-9 in the residual's high-conditioning
 direction. Skipped at n≥8 in `ex_gmstab_pcleft_bjacobi.c`. Workaround: use `PC_RIGHT`
 or stronger sub-PC.
 
-### `PC_SYMMETRIC` rejected at setup
+### `PC_SYMMETRIC` supported with caveats (Phase 4c)
 
-Phase 4c is deferred. Calling `KSPSetPCSide(ksp, PC_SYMMETRIC)` will produce a clean
-PETSc error at `KSPSetUp` ("KSPGMSTAB does not support that side / norm combination").
-Until Phase 4c implements proper split-symmetric handling (using
-`PCApplySymmetricRight` for the unwrap), the support is intentionally not declared in
-`KSPSetSupportedNorm` so users get a fast failure instead of a silent wrong answer.
+`KSPSetPCSide(ksp, PC_SYMMETRIC)` is supported with `KSPSetNormType(KSP_NORM_PRECONDITIONED)`
+(natural pairing) or `KSP_NORM_NONE`. The cycle operates on `M = B_L⁻¹·A·B_R⁻¹`, with
+`bLocal` preconditioned by `PCApplySymmetricLeft` once at solve start and the unwrap at
+finalize/snapshot routed through `PCApplySymmetricRight` (only the right factor `B_R⁻¹`).
 
-Workaround: use `PC_LEFT` or `PC_RIGHT` and ignore the PC's symmetric structure.
-PCBJACOBI / PCASM with default sub-PCs work cleanly under `PC_RIGHT`.
+`KSP_NORM_UNPRECONDITIONED` with `PC_SYMMETRIC` is intentionally NOT declared — the
+algorithm tracks `||r_pre||` natively, and converting to `||r_unprec||` would require
+an extra `PCApplySymmetricLeft` per snapshot (similar cost to the PC_LEFT + UNPREC
+case documented above). Use the natural pairing.
+
+**PETSc-side limitation: not all PCs implement `PCApplySymmetricLeft/Right` cleanly.**
+
+| PC type | `PC_SYMMETRIC` support |
+|---|---|
+| `PCJACOBI` | Works — symmetric square-root split, `B_L = B_R = sqrt(diag(A))` |
+| `PCICC` | Works (SPD-only) |
+| `PCCHOLESKY` | Works (SPD-only) |
+| `PCBJACOBI` | Works **iff** sub-PC supports symmetric apply. Default sub-PC is `KSPPREONLY+PCILU`; PCILU's symmetric path is broken (see below). Use `-sub_pc_type jacobi` to make this work. |
+| `PCSHELL` | Works (user provides `applysymmetricleft/right`) |
+| `PCMAT`, `PCBDDC`, `PCNN`, `PCLMVM`, `PCTFS`, `PCPBJACOBI`, `PCVPBJACOBI` | Implement `applysymmetricleft/right` per source; not exercised by gmstab tests |
+| `PCILU` | **PETSc-internal limitation:** `PCApplySymmetricLeft_ILU` calls `MatForwardSolve` which errors with "No method forwardsolve for Mat of type seqaij". The factored-matrix forwardsolve op isn't being attached for the symmetric path. Avoid until PETSc fixes this; use `PC_RIGHT` + `PCILU` instead. |
+| `PCSOR`, `PCASM`, `PCGAMG`, `PCHYPRE` | Don't implement `applysymmetricleft/right`. PETSc errors at the dispatch layer. Use `PC_LEFT` or `PC_RIGHT`. |
+
+Validated under cdr_small: `PC_SYMMETRIC + PCJACOBI` and
+`PC_SYMMETRIC + PCBJACOBI(-sub_pc_type jacobi)` at n=1/2/4/8 ranks. See
+`tests/ex_gmstab_pcsymmetric_sweep.c`.
+
+### MATLAB split-precond baselines (Phase 5a forecast)
+
+The reference MATLAB tests use `A_fun = @(v) L\(A*(R\v))` patterns with explicit
+`L` and `R` factors. The natural Phase 5a mapping is `KSPSetPCSide(PC_SYMMETRIC) + PCSHELL`,
+with `PCSHELL`'s `applysymmetricleft` set to `L⁻¹` and `applysymmetricright` set to `R⁻¹`.
+This preserves the exact algebra of the reference and exercises the gmstab
+PC_SYMMETRIC path.
 
 ### GPU preconditioners not yet validated
 
