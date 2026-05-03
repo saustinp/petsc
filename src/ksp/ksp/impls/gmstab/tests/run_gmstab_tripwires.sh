@@ -34,6 +34,7 @@ VALIDATORS=(
   "ex_gmstab_pcleft_bjacobi"        # Phase 4b: PC_LEFT + BJacobi (skips n=8 stall)
   "ex_gmstab_pc_sweep"              # Phase 4d: cross-product (pc_side, pc_type) sweep on cdr_small
   "ex_gmstab_pc_multisolve"         # Phase 4 audit: 3 multi-solve scenarios with PC_RIGHT and pc_side switch
+  "ex_gmstab_pc_symmetric_rejected" # Phase 4 final audit: PC_SYMMETRIC must error, not silent wrong-answer
 )
 
 # Parallel runs (same binaries, varies mpiexec -n).

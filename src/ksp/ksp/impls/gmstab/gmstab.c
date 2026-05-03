@@ -70,6 +70,25 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
   KSP_GMSTAB *gms = (KSP_GMSTAB *)ksp->data;
   PetscFunctionBegin;
 
+  /* Phase 4 final-audit defense-in-depth: PC_SYMMETRIC is intentionally not
+     declared in KSPSetSupportedNorm (gmstab.c:993-1007), so PETSc's KSPSetUp
+     should reject it. Guard explicitly here in case (a) a future refactor
+     re-adds the registration without fixing the helper-code unwrap, (b) the
+     user changes pc_side via KSPSetPCSide between solves on a configured
+     KSP and that path bypasses re-validation. The helpers at
+     gmstab_helpers.c:FinalizeSolution_Private and Snapshot_Private currently
+     treat PC_SYMMETRIC as a synonym for PC_RIGHT, which uses full PCApply
+     instead of PCApplySymmetricRight — silently wrong for split-symmetric
+     PCs B = B_L * B_R. Phase 4c will implement properly; until then, error. */
+  {
+    PCSide pc_side_check;
+    PetscCall(KSPGetPCSide(ksp, &pc_side_check));
+    PetscCheck(pc_side_check != PC_SYMMETRIC, PetscObjectComm((PetscObject)ksp),
+               PETSC_ERR_SUP,
+               "KSPGMSTAB: PC_SYMMETRIC is not yet supported (Phase 4c). "
+               "Use PC_LEFT or PC_RIGHT.");
+  }
+
   /* Reset per-solve counters and state. */
   gms->snapshot_count             = 0;
   gms->matvec_count               = 0;
@@ -132,9 +151,11 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
      Initialisation re-allocates V0/V1/Z lazily on the first cycle.
 
      gms->x_initial_guess (Phase 4a) is allocated/copied AFTER this destroy
-     block on a per-solve basis when pc_side ∈ {PC_RIGHT, PC_SYMMETRIC};
-     destroying here means a previous solve in PC_RIGHT mode can't leak
-     stale state into a subsequent PC_NONE solve, and that the Vec is
+     block on a per-solve basis when pc_side == PC_RIGHT (PC_SYMMETRIC is
+     rejected at solve start; Phase 4c will re-enable it with the correct
+     PCApplySymmetricRight unwrap, at which point this conditional should be
+     extended). Destroying here means a previous solve in PC_RIGHT mode can't
+     leak stale state into a subsequent PC_NONE solve, and that the Vec is
      fresh-from-b on each invocation regardless of pc_side history. */
   PetscCall(VecDestroy(&gms->b_local));
   PetscCall(VecDestroy(&gms->x_global));
@@ -154,21 +175,24 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
      KSPSetInitialGuessNonzero this is non-zero). */
   PetscCall(VecCopy(x_local, gms->x_global));
 
-  /* Phase 4a — for PC_RIGHT (and PC_SYMMETRIC, deferred), save the user's
-     initial guess in a dedicated Vec. The algorithm internally tracks
-     x_alg = x_global + x_local in the M-space (where M = A·B⁻¹). At solve
-     end the user-visible solution is recovered as
-     x_user = x_initial + B⁻¹·(x_alg − x_initial). Without this save we
-     can't recover x_user after the algorithm has accumulated restart
-     contributions into x_global.
+  /* Phase 4a — for PC_RIGHT, save the user's initial guess in a dedicated
+     Vec. The algorithm internally tracks x_alg = x_global + x_local in the
+     M-space (where M = A·B⁻¹). At solve end the user-visible solution is
+     recovered as x_user = x_initial + B⁻¹·(x_alg − x_initial). Without this
+     save we can't recover x_user after the algorithm has accumulated
+     restart contributions into x_global.
 
      Done AFTER the per-solve VecDestroy block above (so a stale Vec from
      a prior solve is freed) and BEFORE the VecSet(x_local, 0.0) below
-     (so the initial guess is still readable from x_global / x_local). */
+     (so the initial guess is still readable from x_global / x_local).
+
+     PC_SYMMETRIC is rejected at the top of KSPSolve_GMSTAB (Phase 4 final
+     audit defense-in-depth); Phase 4c will extend this conditional and
+     route through PCApplySymmetricRight in the unwrap. */
   {
     PCSide pc_side_for_init;
     PetscCall(KSPGetPCSide(ksp, &pc_side_for_init));
-    if (pc_side_for_init == PC_RIGHT || pc_side_for_init == PC_SYMMETRIC) {
+    if (pc_side_for_init == PC_RIGHT) {
       PetscCall(VecDuplicate(b, &gms->x_initial_guess));
       PetscCall(VecCopy(gms->x_global, gms->x_initial_guess));
     }
@@ -236,7 +260,9 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
      A-matvec). Done after bLocal is fully formed and before VecCopy
      into gms->r below.
 
-     For PC_NONE / PC_RIGHT / PC_SYMMETRIC this block is a no-op. */
+     For PC_NONE / PC_RIGHT this block is a no-op. PC_SYMMETRIC is
+     rejected at solve start; Phase 4c will define its bLocal preconditioning
+     when it lands. */
   {
     PCSide pc_side_for_blocal;
     PetscCall(KSPGetPCSide(ksp, &pc_side_for_blocal));

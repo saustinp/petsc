@@ -79,9 +79,14 @@ PETSC_INTERN PetscErrorCode KSPGMSTABSnapshotLocal_Private(KSP ksp, KSP_GMSTAB *
      pc_side = PC_NONE  or PC_LEFT   →  x_local := x_global + x_local
      pc_side = PC_RIGHT              →  x_local := x_initial_guess + B⁻¹ ·
                                                   (x_global + x_local − x_initial_guess)
-     pc_side = PC_SYMMETRIC          →  TODO (Phase 4c) — currently treated as PC_RIGHT,
-                                        which is exact for the common B = B_R case but
-                                        not strictly correct for split symmetric PCs.
+     pc_side = PC_SYMMETRIC          →  REJECTED at solve start (Phase 4 final-audit
+                                        defense-in-depth). The Phase 4c plan is to
+                                        unwrap via PCApplySymmetricRight (only the
+                                        right factor B_R⁻¹), which differs from the
+                                        full PCApply that PC_RIGHT uses. Until that's
+                                        implemented, KSPSolve_GMSTAB errors with
+                                        PETSC_ERR_SUP rather than silently producing
+                                        a wrong x_user.
 
    Must be called from EVERY return path in KSPSolve_GMSTAB that returns
    AFTER `VecSet(x_local, 0.0)` has zeroed the initial guess in x_local.

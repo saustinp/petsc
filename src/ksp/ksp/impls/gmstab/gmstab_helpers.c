@@ -47,7 +47,10 @@ PETSC_INTERN PetscErrorCode KSPGMSTABSnapshotLocal_Private(KSP ksp, KSP_GMSTAB *
  *     PC_NONE / PC_LEFT:  x_user = x_global + x_local       (unchanged)
  *     PC_RIGHT:           x_user = x_initial + B⁻¹ · (x_global + x_local
  *                                                       − x_initial)
- *     PC_SYMMETRIC:       same as PC_RIGHT for now (Phase 4c TODO)
+ *     PC_SYMMETRIC:       NOT REACHABLE — rejected at solve start. Phase 4c
+ *                         will implement properly via PCApplySymmetricRight
+ *                         (only the right factor B_R⁻¹ should be applied;
+ *                         using full PCApply is wrong for split-symmetric PCs).
  *
  *   Idempotency: callers must only call this once per solve and must
  *   NOT VecAXPY x_global into x_local separately. The legacy inline
@@ -65,8 +68,16 @@ PETSC_INTERN PetscErrorCode KSPGMSTABFinalizeSolution_Private(KSP ksp, KSP_GMSTA
   PCSide pc_side;
   PetscCall(KSPGetPCSide(ksp, &pc_side));
 
-  if (pc_side == PC_RIGHT || pc_side == PC_SYMMETRIC) {
-    /* Right (or symmetric, treated as right for now) preconditioning:
+  /* Defense-in-depth: PC_SYMMETRIC is rejected at solve start (see
+     KSPSolve_GMSTAB top-of-function check); if we reach here with
+     PC_SYMMETRIC something has gone wrong. The PCApply on the next branch
+     would silently produce a wrong unwrap for split-symmetric PCs. */
+  PetscCheck(pc_side != PC_SYMMETRIC, PetscObjectComm((PetscObject)ksp), PETSC_ERR_PLIB,
+             "KSPGMSTABFinalizeSolution_Private: PC_SYMMETRIC reached past the "
+             "solve-start guard. Phase 4c not yet implemented.");
+
+  if (pc_side == PC_RIGHT) {
+    /* Right preconditioning:
        x_user = x_initial + B⁻¹ · (x_global + x_local − x_initial).
        The Vec x_initial_guess MUST have been allocated at solve start
        (gmstab.c does this conditionally on pc_side); if it's NULL here,
@@ -160,7 +171,13 @@ PETSC_INTERN PetscErrorCode KSPGMSTABSnapshot_Private(KSP ksp, KSP_GMSTAB *gms,
        below short-circuits the extra PCApply on those paths. */
     Vec x_for_mult = x_total;
     Vec x_unwrap   = NULL;       /* freed at end iff we allocated it */
-    if (ksp->pc_side == PC_RIGHT || ksp->pc_side == PC_SYMMETRIC) {
+    /* PC_SYMMETRIC defense-in-depth: rejected at solve start. If reached
+       here, the unwrap below would use full PCApply instead of the correct
+       PCApplySymmetricRight, silently producing wrong x_for_mult. */
+    PetscCheck(ksp->pc_side != PC_SYMMETRIC, PetscObjectComm((PetscObject)ksp), PETSC_ERR_PLIB,
+               "KSPGMSTABSnapshot_Private: PC_SYMMETRIC reached past the "
+               "solve-start guard. Phase 4c not yet implemented.");
+    if (ksp->pc_side == PC_RIGHT) {
       PetscCheck(gms->x_initial_guess, PetscObjectComm((PetscObject)ksp), PETSC_ERR_PLIB,
                  "KSPGMSTABSnapshot_Private: pc_side=%d but gms->x_initial_guess is NULL — "
                  "the solve-start initial-guess save was skipped or destroyed prematurely",
