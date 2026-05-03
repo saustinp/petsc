@@ -95,8 +95,17 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
 
   /* Open trace CSV if requested. The C++ port writes the first snapshot
      in PerfMeasure's constructor (matvec=0, iterres=||b||, trueres=||b||,
-     runtime=0); reproduce that exactly. */
-  if (gms->trace_csv && !gms->trace_fp) {
+     runtime=0); reproduce that exactly.
+
+     Close-and-reopen on every KSPSolve so a second call to the same KSP
+     object overwrites (rather than appends to) the trace file. This
+     matches the bit-equivalence harness's expectation that one KSPSolve
+     == one CSV. KSPReset_GMSTAB also closes the handle as a safety net. */
+  if (gms->trace_csv) {
+    if (gms->trace_fp) {
+      fclose(gms->trace_fp);
+      gms->trace_fp = NULL;
+    }
     gms->trace_fp = fopen(gms->trace_csv_path, "w");
     PetscCheck(gms->trace_fp, PetscObjectComm((PetscObject)ksp), PETSC_ERR_FILE_OPEN,
                "Cannot open trace_csv: %s", gms->trace_csv_path);
@@ -113,6 +122,22 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
   Vec b, x_local;
   PetscCall(KSPGetRhs(ksp, &b));
   x_local = ksp->vec_sol;
+
+  /* Destroy any vectors / dense-mats / host buffers lingering from a
+     previous KSPSolve before re-allocating. VecDuplicate / MatCreate into
+     a non-NULL pointer would leak the prior object; this defends against
+     multi-solve without an explicit KSPReset between. The Mats and Z buffer
+     are also sized by `s`, so destroying them is the only safe way to
+     handle a user that changes s with KSPGMSTABSetS between solves —
+     Initialisation re-allocates V0/V1/Z lazily on the first cycle. */
+  PetscCall(VecDestroy(&gms->b_local));
+  PetscCall(VecDestroy(&gms->x_global));
+  PetscCall(VecDestroy(&gms->r));
+  PetscCall(VecDestroy(&gms->work_n));
+  PetscCall(VecDestroy(&gms->work_n2));
+  PetscCall(MatDestroy(&gms->V0));
+  PetscCall(MatDestroy(&gms->V1));
+  PetscCall(PetscFree(gms->Z));
 
   PetscCall(VecDuplicate(b, &gms->b_local));
   PetscCall(VecDuplicate(b, &gms->x_global));
@@ -169,14 +194,28 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
   PetscCall(KSPGMSTABInitialisation_Private(ksp, gms, &ws, x_local, gms->r, &beta_curr));
   gms->beta = beta_curr;
 
-  if (ksp->reason) {
-    /* Convergence test inside Initialisation triggered. */
+  /* Post-init duplicate snapshot — matches C++ solver.cpp:743. Emitted
+     UNCONDITIONALLY here so the trace structure matches C++ even on
+     paths where Init bails early (e.g. its inner gmres converged). The
+     payload is unchanged from Init's internal final perf.read (same x,
+     same beta, same matvec count); the row is a deliberate duplicate. */
+  PetscCall(KSPGMSTABSnapshotLocal_Private(ksp, gms, x_local, beta_curr));
+
+  if (ksp->reason && ksp->reason != KSP_CONVERGED_ITERATING) {
+    /* Convergence test inside Initialisation OR the post-init dup
+       triggered. After this point x_local has been zeroed and
+       accumulates the cycle-local update; the full user-visible solution
+       is x_global + x_local. (For zero initial guess this VecAXPY is a
+       no-op; for nonzero initial guess this restores the caller's
+       KSPSetInitialGuessNonzero contract.) */
+    PetscCall(VecAXPY(x_local, 1.0, gms->x_global));
     PetscCall(KSPGMSTABInnerWorkspaceDestroy_Private(&ws));
     PetscFunctionReturn(PETSC_SUCCESS);
   }
 
   if (gms->beta <= ksp->abstol) {
     ksp->reason = KSP_CONVERGED_ATOL;
+    PetscCall(VecAXPY(x_local, 1.0, gms->x_global));
     PetscCall(KSPGMSTABInnerWorkspaceDestroy_Private(&ws));
     PetscFunctionReturn(PETSC_SUCCESS);
   }
@@ -184,22 +223,16 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
   /* Phase 3b validation path: -ksp_gmstab_force_l1_only runs exactly one
      Cycle1 invocation, then exits. Lets ex_gmstab_cycle1 diff the cycle's
      output against the C++ oracle without the flying-restart driver in
-     the way. */
+     the way. The post-init dup snapshot fired above plays the role of
+     the C++ "begin-of-cycle" perf.read for this path too. */
   if (gms->force_l1_only) {
-    /* Begin-of-cycle snapshot — matches the C++ main solver loop's
-       perf.read at solver.cpp:541-543 (the duplicate of Init's final
-       perf.read). mv and beta are unchanged from Init's last snapshot
-       since no work has happened in between, so this snapshot has the
-       same payload as the previous one. */
-    PetscCall(KSPGMSTABSnapshot_Private(ksp, gms, x_local, beta_curr));
-
     PetscCall(KSPGMSTABCycle1_Private(ksp, gms, &ws, x_local, gms->r, &beta_curr));
     gms->beta = beta_curr;
     gms->cycle_count++;
 
     /* Post-cycle snapshot — matches the C++ main solver loop's perf.read
        at solver.cpp:599-602, paired with the cycle's own final read. */
-    PetscCall(KSPGMSTABSnapshot_Private(ksp, gms, x_local, beta_curr));
+    PetscCall(KSPGMSTABSnapshotLocal_Private(ksp, gms, x_local, beta_curr));
 
     if (gms->beta <= ksp->abstol) {
       ksp->reason = KSP_CONVERGED_ATOL;
@@ -210,21 +243,20 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
         "KSPSolve_GMSTAB force_l1_only: ran one Cycle1, beta=%.6e > tolabs=%.6e\n",
         (double)gms->beta, (double)ksp->abstol));
     }
+    PetscCall(VecAXPY(x_local, 1.0, gms->x_global));
     PetscCall(KSPGMSTABInnerWorkspaceDestroy_Private(&ws));
     PetscFunctionReturn(PETSC_SUCCESS);
   }
 
   if (gms->force_l2_only) {
-    /* Symmetric to force_l1_only: begin-of-cycle snapshot, one Cycle2,
-       post-cycle snapshot, exit. */
-    PetscCall(KSPGMSTABSnapshot_Private(ksp, gms, x_local, beta_curr));
-
+    /* Symmetric to force_l1_only: post-init dup served as begin-of-cycle,
+       one Cycle2, post-cycle snapshot, exit. */
     PetscCall(KSPGMSTABCycle2_Private(ksp, gms, &ws, x_local, gms->r, &beta_curr));
     gms->beta = beta_curr;
     gms->cycle_count++;
     gms->n2cycles++;
 
-    PetscCall(KSPGMSTABSnapshot_Private(ksp, gms, x_local, beta_curr));
+    PetscCall(KSPGMSTABSnapshotLocal_Private(ksp, gms, x_local, beta_curr));
 
     if (gms->beta <= ksp->abstol) {
       ksp->reason = KSP_CONVERGED_ATOL;
@@ -234,19 +266,137 @@ static PetscErrorCode KSPSolve_GMSTAB(KSP ksp)
         "KSPSolve_GMSTAB force_l2_only: ran one Cycle2, beta=%.6e > tolabs=%.6e\n",
         (double)gms->beta, (double)ksp->abstol));
     }
+    PetscCall(VecAXPY(x_local, 1.0, gms->x_global));
     PetscCall(KSPGMSTABInnerWorkspaceDestroy_Private(&ws));
     PetscFunctionReturn(PETSC_SUCCESS);
   }
 
-  /* Phase 3a checkpoint: cycle bodies not yet wired into the production
-     driver loop (cycle2 + flying restart still pending). */
-  ksp->reason = KSP_DIVERGED_BREAKDOWN;
-  PetscCall(PetscInfo(ksp,
-    "KSPSolve_GMSTAB phase-3a: Initialisation completed with beta=%.6e "
-    "but cycle bodies (gmstab1/gmstab2) are not yet wired into the "
-    "production driver. See PHASE3_STATUS.md for the remaining work.\n",
-    (double)gms->beta));
+  /* ============================================================================
+     Natural-flow flying-restart driver loop. 1:1 port of solver.cpp:742-815.
 
+     Snapshot rhythm:
+       - Init's internal final snapshot fired inside Initialisation.
+       - The post-init duplicate snapshot fired UNCONDITIONALLY above
+         (matches C++ line 743); see the unified snapshot site after Init
+         returns. We don't emit it again here.
+       - Each loop iter: cycle (which emits its own internal final snapshot),
+         then optional restart/replace work (with one counted matvec), then
+         an end-of-iter snapshot (matches C++ line 812).
+
+     betaMax bookkeeping: post-init betaMax = max(post-init beta, betaLocal).
+     C++ does this at solver.cpp:746 — we mirror it AFTER Initialisation has
+     run and updated beta_curr. (Note: gms->beta_max was set above to the
+     pre-init beta as a placeholder for the force_l*_only paths, which
+     don't touch betaMax — here we overwrite it with the correct post-init
+     value.) ============================================================================ */
+
+  gms->beta_max = PetscMax(beta_curr, gms->beta_local);
+
+  PetscCheck(gms->s <= 64, PetscObjectComm((PetscObject)ksp), PETSC_ERR_ARG_OUTOFRANGE,
+             "KSPGMSTAB: s = %" PetscInt_FMT " exceeds the natural-flow driver's "
+             "stack-allocated eta/xi buffer (max 64). Bump the buffer or set s smaller.",
+             gms->s);
+
+  Vec Ax_drv;
+  PetscCall(VecDuplicate(b, &Ax_drv));   /* scratch for the counted matvec at restart/replace */
+
+  while (beta_curr > ksp->abstol) {
+    PetscBool t_restart = PETSC_FALSE, t_replace = PETSC_FALSE;
+    if (beta_curr < gms->c_restart * gms->beta_local) {
+      t_restart = PETSC_TRUE;
+    } else if (beta_curr < gms->c_replace * gms->beta_max) {
+      t_replace = PETSC_TRUE;
+    } else {
+      gms->beta_max = PetscMax(gms->beta_max, beta_curr);
+    }
+
+    /* L selection (C++ solver.cpp:772-775). force_l1_only / force_l2_only are
+       handled by the early-out branches above and never reach here. */
+    PetscInt L_eff = (t_restart || t_replace || gms->n2cycles > gms->n2cycles_max) ? 1 : 2;
+
+    if (L_eff == 1) {
+      PetscCall(KSPGMSTABCycle1_Private(ksp, gms, &ws, x_local, gms->r, &beta_curr));
+      gms->n2cycles = 0;
+    } else {
+      PetscCall(KSPGMSTABCycle2_Private(ksp, gms, &ws, x_local, gms->r, &beta_curr));
+      gms->n2cycles += 1;
+    }
+    gms->beta = beta_curr;
+    gms->cycle_count++;
+
+    /* Cycle's internal final snapshot may have triggered convergence /
+       divergence via KSPConvergedDefault. Honour that. */
+    if (beta_curr <= ksp->abstol) {
+      ksp->reason = KSP_CONVERGED_ATOL;
+      break;
+    }
+    if (ksp->reason && ksp->reason != KSP_CONVERGED_ITERATING) break;
+
+    if (t_restart || t_replace) {
+      /* r = bLocal - A * x_local;  counted matvec (C++ solver.cpp:795). */
+      PetscCall(KSP_PCApplyBAorAB(ksp, x_local, Ax_drv, ws.work_n));
+      gms->matvec_count++;
+      PetscCall(VecWAXPY(gms->r, -1.0, Ax_drv, gms->b_local));
+
+      /* eta = P^T * r — s VecDots in P-column order (matches Eigen's
+         column-major P.transpose() * r). */
+      PetscScalar eta[64];
+      for (PetscInt k = 0; k < gms->s; ++k) {
+        Vec pk;
+        PetscCall(MatDenseGetColumnVecRead(gms->P, k, &pk));
+        PetscCall(VecDot(gms->r, pk, &eta[k]));
+        PetscCall(MatDenseRestoreColumnVecRead(gms->P, k, &pk));
+      }
+
+      /* dir_rbio: xi := Z \ eta (lower-tri); r -= V1 * xi; x += V0 * xi.
+         Mirror of gmstab_cpp::dir_rbio. The trsv writes xi into eta[] in
+         place. The two AXPY loops walk V1 and V0 columns simultaneously
+         to amortize column borrow/restore. */
+      PetscCall(KSPGMSTABTrsv_Private("L", "N", "N", gms->s, gms->Z, gms->Z_ldim, eta, 1));
+      for (PetscInt k = 0; k < gms->s; ++k) {
+        Vec V1k, V0k;
+        PetscCall(MatDenseGetColumnVecRead(gms->V1, k, &V1k));
+        PetscCall(VecAXPY(gms->r, -eta[k], V1k));
+        PetscCall(MatDenseRestoreColumnVecRead(gms->V1, k, &V1k));
+        PetscCall(MatDenseGetColumnVecRead(gms->V0, k, &V0k));
+        PetscCall(VecAXPY(x_local, eta[k], V0k));
+        PetscCall(MatDenseRestoreColumnVecRead(gms->V0, k, &V0k));
+      }
+      PetscCall(VecNorm(gms->r, NORM_2, &beta_curr));
+      gms->beta = beta_curr;
+      gms->beta_max = beta_curr;
+    } else {
+      gms->beta_max = PetscMax(beta_curr, gms->beta_max);
+    }
+
+    if (t_restart) {
+      /* C++ solver.cpp:804-808:  bLocal = r;  xGlobal += x;  x = 0;
+                                   betaLocal = beta. */
+      PetscCall(VecCopy(gms->r, gms->b_local));
+      PetscCall(VecAXPY(gms->x_global, 1.0, x_local));
+      PetscCall(VecSet(x_local, 0.0));
+      gms->beta_local = beta_curr;
+    }
+
+    /* End-of-iter snapshot (C++ solver.cpp:812). */
+    PetscCall(KSPGMSTABSnapshotLocal_Private(ksp, gms, x_local, beta_curr));
+    if (ksp->reason && ksp->reason != KSP_CONVERGED_ITERATING) break;
+  }
+
+  /* If the loop exited solely on the natural while-condition (beta <= abstol),
+     KSPConvergedDefault may not have fired KSP_CONVERGED_ATOL via the most
+     recent snapshot — make sure we report ATOL rather than ITERATING. */
+  if (beta_curr <= ksp->abstol && (!ksp->reason || ksp->reason == KSP_CONVERGED_ITERATING)) {
+    ksp->reason = KSP_CONVERGED_ATOL;
+  }
+
+  /* On exit, leave the user-visible solution in ksp->vec_sol. The C++ port
+     returns out.x = local x, but that's only meaningful when xGlobal=0
+     (no restart fired). To mirror the *true* solution under the flying-
+     restart algebra, we accumulate xGlobal into x_local before returning. */
+  PetscCall(VecAXPY(x_local, 1.0, gms->x_global));
+
+  PetscCall(VecDestroy(&Ax_drv));
   PetscCall(KSPGMSTABInnerWorkspaceDestroy_Private(&ws));
   PetscFunctionReturn(PETSC_SUCCESS);
 }

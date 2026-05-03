@@ -59,3 +59,14 @@ PETSC_INTERN PetscErrorCode KSPGMSTABLoadShadowFile_Private(KSP ksp, KSP_GMSTAB 
    semantics). */
 PETSC_INTERN PetscErrorCode KSPGMSTABSnapshot_Private(KSP ksp, KSP_GMSTAB *gms,
                                                        Vec x_total, PetscReal iter_norm);
+
+/* Like KSPGMSTABSnapshot_Private but takes x_local (the per-cycle update,
+   typically reset to zero after each restart) and internally constructs
+   x_total = gms->x_global + x_local. Use this at *every* snapshot site
+   where you have x_local in scope and the cycle/driver may have
+   accumulated a non-zero x_global from prior restarts. The pgmres /
+   aug_gmres mid-iter callbacks already build x_global_plus_local
+   themselves (they need to evaluate at intermediate iter solutions);
+   they should keep using KSPGMSTABSnapshot_Private directly. */
+PETSC_INTERN PetscErrorCode KSPGMSTABSnapshotLocal_Private(KSP ksp, KSP_GMSTAB *gms,
+                                                            Vec x_local, PetscReal iter_norm);

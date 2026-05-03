@@ -22,12 +22,20 @@ VALIDATORS=(
   "ex_gmstab_init_nonzero_guess"    # constructor row stays correct with x0 != 0
   "ex_gmstab_cycle1"                # Cycle1 force_l1 trace vs C++ force_l1 trace
   "ex_gmstab_cycle2"                # Cycle2 force_l2 trace vs C++ force_l2 trace
+  "ex_gmstab_natural"               # full natural-flow flying-restart driver
+  "ex_gmstab_natural_nzg"           # natural-flow with KSPSetInitialGuessNonzero (x_global accumulation)
+  "ex_gmstab_determinism"           # same-rank repeatability (byte-identical traces across two runs)
+  "ex_gmstab_multisolve"            # KSPSolve called twice on same KSP — bit-identical x's
+  "ex_gmstab_multisolve_rng"        # multi-solve via default-RNG shadow path (re-seed on every call)
+  "ex_gmstab_schange"               # s changes between two KSPSolve calls (V0/V1/Z re-alloc at correct size)
 )
 
-# Parallel runs of cycle1 (uses the same binary, varies mpiexec -n).
-# Each rank count exercises a different MPI reduction order; cycle1
-# must produce a residual matching the C++ sequential reference within
-# the parallel tolerance (1e-7 in the validator).
+# Parallel runs (same binaries, varies mpiexec -n).
+# Each rank count exercises a different MPI reduction order; the
+# validators must produce a residual matching the C++ sequential reference
+# within the parallel tolerance (1e-7 for cycle1/cycle2 init prefix; same
+# for natural-flow which gates only on the gauge-independent init prefix
+# at machine precision and on structural correctness elsewhere).
 PARALLEL_RANKS=(2 4 8)
 MPIEXEC=/home/sam/.local/mpich/bin/mpiexec
 
@@ -71,7 +79,9 @@ echo "[tripwires] sequential summary: $((total - fail_count))/$total passed"
 # ---- Parallel cycle1 runs ----
 parallel_total=0
 parallel_fails=0
-PARALLEL_VALIDATORS=(ex_gmstab_cycle1 ex_gmstab_cycle2)
+PARALLEL_VALIDATORS=(ex_gmstab_cycle1 ex_gmstab_cycle2 ex_gmstab_natural
+                     ex_gmstab_natural_nzg ex_gmstab_determinism ex_gmstab_multisolve
+                     ex_gmstab_multisolve_rng ex_gmstab_schange)
 for v in "${PARALLEL_VALIDATORS[@]}"; do
   bin=/tmp/$v
   if [ ! -f "$bin" ]; then
@@ -143,5 +153,45 @@ done
 
 echo ""
 echo "[tripwires] seq-vs-parallel cross-check: $((xtotal - xfails))/$xtotal passed"
-echo "[tripwires] OVERALL: $((total + parallel_total + xtotal - fail_count - parallel_fails - xfails))/$((total + parallel_total + xtotal)) passed"
-exit $((fail_count + parallel_fails + xfails))
+
+# ---- Natural-flow seq-vs-parallel residual-trace coherence ----
+# Both runs of ex_gmstab_natural use LAPACK on identical input data.
+# The Init prefix (rows 0..11) is gauge-INDEPENDENT — produced by
+# inner gmres_m with no SVD/QR/LQ. Drift between seq and parallel here
+# is purely MPI Allreduce reordering, which should be ≤ 1e-12. The
+# matvec column must match exactly through that prefix. Beyond row 11,
+# the polynomial step amplifies even Allreduce noise so we don't gate
+# on per-row drift.
+nfails=0
+ntotal=0
+NATURAL_DIFF_TOOL="$TESTS/diff_natural_seq_vs_par.py"
+NATURAL_BIN=/tmp/ex_gmstab_natural
+NATURAL_TRACE=/tmp/petsc_natural_residuals.csv
+if [ -f "$NATURAL_BIN" ]; then
+  # Re-run sequential to repopulate the trace (the parallel runs above
+  # may have left a parallel-mode trace at $NATURAL_TRACE).
+  "$NATURAL_BIN" >/dev/null 2>&1 || true
+  cp "$NATURAL_TRACE" /tmp/petsc_natural_residuals.seq.csv 2>/dev/null || true
+
+  for n in 2 4; do
+    ntotal=$((ntotal + 1))
+    "$MPIEXEC" -n "$n" "$NATURAL_BIN" >/dev/null 2>&1 || true
+    cp "$NATURAL_TRACE" /tmp/petsc_natural_residuals.p${n}.csv 2>/dev/null || true
+    echo "[tripwires] natural seq-vs-${n}rank trace coherence..."
+    if python3 "$NATURAL_DIFF_TOOL" \
+         /tmp/petsc_natural_residuals.seq.csv \
+         /tmp/petsc_natural_residuals.p${n}.csv \
+         >"/tmp/natural_seq_p${n}.diff.log" 2>&1; then
+      worst=$(grep -oP 'worst drift: iter=\S+' /tmp/natural_seq_p${n}.diff.log | head -1 || echo "")
+      echo "[tripwires] natural seq-vs-${n}rank: PASS  ($worst)"
+    else
+      echo "[tripwires] natural seq-vs-${n}rank: FAIL — see /tmp/natural_seq_p${n}.diff.log"
+      tail -15 /tmp/natural_seq_p${n}.diff.log | sed 's/^/[tripwires]   /'
+      nfails=$((nfails + 1))
+    fi
+  done
+fi
+echo "[tripwires] natural seq-vs-parallel coherence: $((ntotal - nfails))/$ntotal passed"
+
+echo "[tripwires] OVERALL: $((total + parallel_total + xtotal + ntotal - fail_count - parallel_fails - xfails - nfails))/$((total + parallel_total + xtotal + ntotal)) passed"
+exit $((fail_count + parallel_fails + xfails + nfails))

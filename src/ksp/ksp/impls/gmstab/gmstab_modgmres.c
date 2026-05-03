@@ -68,6 +68,13 @@ PETSC_INTERN PetscErrorCode KSPGMSTABInnerWorkspaceCreate_Private(KSP ksp, Petsc
 
   ws->s = s;
   ws->m = 0;
+  /* Defensive: callers MUST set matvec_count_ptr immediately after this
+     create call to enable matvec counting; until they do, NULL means
+     "don't count" (gmres_m / pgmres_m / aug_gmres_m all check before
+     dereferencing). Zeroing here protects against a future caller that
+     forgets to set it — the alternative (uninitialised stack) would
+     either crash or worse, silently dereference garbage memory. */
+  ws->matvec_count_ptr = NULL;
 
   /* Build W as a MATDENSE that mirrors template_vec's layout. */
   PetscInt n_local;

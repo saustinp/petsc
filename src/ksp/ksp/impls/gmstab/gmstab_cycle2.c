@@ -472,7 +472,7 @@ PETSC_INTERN PetscErrorCode KSPGMSTABCycle2_Private(KSP ksp, KSP_GMSTAB *gms,
   PetscCall(KSPGMSTABDumpVec_Private(7, "x_postUpd", x_local));
 
   /* (11) Mid-cycle snapshot (matches C++ solver.cpp:436-438). */
-  PetscCall(KSPGMSTABSnapshot_Private(ksp, gms, x_local, beta));
+  PetscCall(KSPGMSTABSnapshotLocal_Private(ksp, gms, x_local, beta));
   if (beta <= ksp->abstol || (ksp->reason && ksp->reason != KSP_CONVERGED_ITERATING)) {
     /* Early-out cleanup. */
     PetscCall(PetscFree(Zinv_Yxi));

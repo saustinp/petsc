@@ -1,6 +1,6 @@
 # Phase 3 — Status checkpoint
 
-**Last updated:** 2026-05-02 (Phase 3b in progress)
+**Last updated:** 2026-05-02 (Phase 3d — audit + tripwire expansion)
 **Branch:** `ksp-gmstab`
 
 ## Phases summary
@@ -13,8 +13,9 @@
 | 3a — Initialisation (port of Initialisation.m) | ✅ committed `1600f35eb9c` | **bit-equivalent on cdr_small at 3e-15** |
 | 3a — small-dense + StabCoeffs | ✅ committed `77fae2e1fe9` | LAPACK helpers + 35° angle |
 | 3b — GMstab1 cycle 1 | ✅ **VALIDATED** | bit-equivalent to C++ on cdr_small at 1.31e-12 drift (most rows 3e-15) |
-| 3b — GMstab2 cycle 2 | ❌ not started | ~400 LOC, biggest cycle |
-| 3b — driver loop | ❌ not started | flying-restart heuristic |
+| 3b — GMstab2 cycle 2 | ✅ **VALIDATED** | bit-equivalent to C++ on cdr_small at 5.26e-12 drift |
+| 3c — natural-flow driver loop | ✅ **VALIDATED** | full flying-restart wired; 5-gate validator passes 1/2/4/8 ranks |
+| 3d — audit + tripwire expansion | ✅ **VALIDATED** | three new tripwires (nzg / determinism / multi-solve), one new cross-check (natural seq-vs-parallel coherence), six fixes for bugs caught by them |
 
 ## Validated bit-equivalence baselines
 
@@ -25,10 +26,67 @@ The following validators live in `tests/`:
 | `ex_gmstab_phase3a` | Initialisation on cdr_small (rows 0–1) | ✅ PASS | matvec exact, iterres/trueres drift ≤ 1e-10, **strict constructor row** |
 | `ex_gmstab_init_nonzero_guess` | Constructor row with non-zero x0 | ✅ PASS | trueres == ‖b‖ within 1e-12 |
 | `ex_gmstab_cycle1` | Cycle 1 force_l1 trace against C++ force_l1 trace | ✅ **PASS** | matvec exact, iterres/trueres drift ≤ 1e-10 (worst observed: 1.31e-12) |
+| `ex_gmstab_cycle2` | Cycle 2 force_l2 trace against C++ force_l2 trace | ✅ **PASS** | matvec exact, iterres/trueres drift ≤ 1e-10 (worst observed: 5.26e-12) |
+| `ex_gmstab_natural` | Full natural-flow flying-restart trace vs `cpp_residuals.csv` | ✅ **PASS** | 5-gate harness: Init prefix bit-equivalent at 1e-10, matvec column matches >= 40% of rows, KSP_CONVERGED_ATOL, final res ≤ 1.5×abstol, total mv ≤ 1.25× C++ baseline |
+| `ex_gmstab_natural_nzg` | Natural-flow with KSPSetInitialGuessNonzero (x0=0.7 const) | ✅ **PASS** | externally-measured ‖b−A·x_returned‖ ≤ 1.5×abstol AND equals KSP-reported rnorm to FP precision (catches missing x_global accumulation on early-out) |
+| `ex_gmstab_determinism` | Two consecutive runs of natural-flow on a fresh KSP each time | ✅ **PASS** | trace files BIT-IDENTICAL byte-for-byte; iter counts identical |
+| `ex_gmstab_multisolve` | KSPSolve called twice on the SAME KSP object | ✅ **PASS** | both reach ATOL with identical iter count and rnorm; ‖x1−x2‖₂ = 0 exactly (catches per-solve state-not-reset) |
+| `diff_natural_seq_vs_par.py` (cross-check) | natural-flow seq trace vs parallel trace | ✅ **PASS** | Init prefix drift ≤ 1e-10 (machine precision; gauge-independent); matvec column exact through prefix; row count parity within 25% |
 
-Run all three with: `tests/run_gmstab_tripwires.sh`. Exit code is the
-number of failing validators. SKIP_BUILD=1 skips the libpetsc rebuild
+Run all eight validators + five cross-checks with: `tests/run_gmstab_tripwires.sh`.
+Exit code is the number of failing checks. SKIP_BUILD=1 skips the libpetsc rebuild
 when iterating on a single validator.
+
+The full suite passes **40/40** on every commit:
+
+* 10 sequential validators (one per validator above plus `multisolve_rng`)
+* 24 parallel runs (cycle1, cycle2, natural, natural_nzg, determinism,
+  multisolve, multisolve_rng, schange × ranks ∈ {2, 4, 8})
+* 4 dump-level cross-checks (cycle1, cycle2 × ranks ∈ {2, 4})
+* 2 trace-level cross-checks (natural seq-vs-parallel × ranks ∈ {2, 4})
+
+### Natural-flow validator design rationale
+
+The `ex_gmstab_natural` validator does **not** gate on per-row 1e-10
+absolute drift over the whole trace. After ~5 cycles drift exceeds
+1e-6, and after ~10 cycles it exceeds 1e-2 — even though the algorithm
+remains structurally correct. The reason is gauge ambiguity:
+
+* PETSc's small-dense layer goes through LAPACK (`dgesdd`, `dgeqrf`,
+  etc.). The C++ port goes through Eigen's BDCSVD/HouseholderQR.
+* These give numerically distinct but mathematically equivalent
+  factorisations: the Z, Q, and V0/V1 they emit differ by a
+  deterministic rotation (the gauge).
+* Per the published GMstab paper, the **cycle outputs are
+  basis-invariant** — final V0/V1/r0/Z span the same subspaces in
+  exact arithmetic. In FP, gauge differences perturb each cycle's
+  output by O(1e-12).
+* The polynomial step at the start of every cycle amplifies this
+  perturbation by ~50×–200×. After 4–5 cycles drift reaches 1e-6;
+  by cycle 10 it's 1e-2. Both ports still converge to `tolabs`.
+
+So the validator's five gates instead check what *should* be
+gauge-independent or structurally invariant:
+
+1. **Init prefix (rows 0..11)**: gauge-INDEPENDENT — produced by
+   inner `gmres_m`, no SVD/QR/LQ. Drift gated at 1e-10.
+2. **matvec column**: each port should issue exactly the same
+   sequence of counted matvecs until trajectories visibly diverge.
+   Must match for ≥ 40% of rows from the start.
+3. **Convergence reason**: must be `KSP_CONVERGED_ATOL`.
+4. **Final residual**: ≤ 1.5×`abstol` (the trajectory might overshoot
+   slightly above tolabs at the snapshot before convergence).
+5. **Total matvec budget**: ≤ 1.25× C++'s matvec count (allows for
+   gauge-induced trajectory taking a few extra matvecs).
+
+Observed numbers on cdr_small (s=4, abstol=1e-10):
+
+| ranks | rows | init prefix drift | matvec match | final res | matvec budget |
+|---|---|---|---|---|---|
+| 1 | 246 | 4.83e-15 | 132/246 | 8.83e-11 | 205 vs 194 (+5.7%) |
+| 2 | 256 | 4.11e-15 | 120/256 | 5.24e-11 | 213 vs 194 (+9.8%) |
+| 4 | 234 | 2.00e-15 | 132/234 | 9.01e-11 | 195 vs 194 (+0.5%) |
+| 8 | 244 | 1.44e-15 | 132/244 | 9.58e-11 | 203 vs 194 (+4.6%) |
 
 ## Phase 3b session — bugs found and fixed
 
@@ -460,21 +518,301 @@ audit pass after each declaration of completeness:
 precision AND parallel-correct on multiple MPI rank counts.** Tripwire
 suite passes 6/6, reproducibly.
 
-## Open Phase 3b work
+## Phase 3c — natural-flow driver
 
-Cycle 2 (`gmstab2` in C++ at `solver.cpp:246-457`, ~210 LOC) and the
-flying-restart driver (`solver.cpp:553-602`) are next. Same validation
-recipe as cycle 1:
+Wired cycle 1 + cycle 2 into the natural-flow flying-restart driver in
+`KSPSolve_GMSTAB` (replacing the Phase 3a stub). The driver is a 1:1
+port of `solver.cpp:742-815`:
 
-1. Implement `KSPGMSTABCycle2_Private` as a 1:1 port of `gmstab2`.
-2. Add a `force_l2_only` knob symmetric to `force_l1_only`.
-3. Add matched checkpoint dumps in both ports.
-4. Build a `cpp_residuals_force_l2.csv` reference fixture.
-5. Add an `ex_gmstab_cycle2` validator that diffs PETSc's force_l2
-   trace against the reference.
-6. Once both cycles pass in isolation, wire them into the
-   flying-restart driver and validate the full natural flow against
-   the original `cpp_residuals.csv` (and then the 124 sweep cases).
+* post-init duplicate snapshot (matches C++ `solver.cpp:743`)
+* `betaMax = max(beta, betaLocal)` after Initialisation
+* `while (beta > tolabs)` loop with t_restart / t_replace / neither
+  bookkeeping using the same constants (c_restart=1e-2, c_replace=1e-2,
+  n2cyclesMax=3) and the same L-selection rule
+* counted matvec + dir_rbio (xi=Z\eta; r-=V1*xi; x+=V0*xi) on
+  restart/replace
+* xGlobal/x_local accumulation on restart
+* end-of-iter snapshot
+
+In the process discovered and fixed a latent restart-aware bug: snapshot
+sites in cycle1.c, cycle2.c, gmstab.c, and gmstab_init.c were passing
+`x_local` (cycle-local solution) instead of `x_total = x_global +
+x_local`. This was a no-op for the force_l*_only validators (xGlobal = 0
+there) but would have produced wrong trueres values on every snapshot
+once flying-restart fired in natural-flow. Introduced a new helper
+`KSPGMSTABSnapshotLocal_Private` that internally constructs the total
+and forwards to `KSPGMSTABSnapshot_Private`. All non-callback snapshot
+sites now use the helper.
+
+The resulting tripwire suite passes 18/18:
+
+* 5 sequential validators (`phase3a`, `init_nonzero_guess`, `cycle1`,
+  `cycle2`, `natural`)
+* 9 parallel runs (cycle1/cycle2/natural × n=2,4,8)
+* 4 seq-vs-parallel checkpoint diffs (cycle1/cycle2 × n=2,4)
+
+See the natural-flow validator design rationale earlier in this file
+for why per-row 1e-10 drift over the entire trace is not the gate.
+
+## Phase 3d — audit + tripwire expansion
+
+In response to a thoroughness mandate ("we need to be incredibly
+thorough and prioritize thoroughness and accuracy of the implementation
+over time to delivery"), did a line-by-line audit of the natural-flow
+driver and the modified snapshot helpers.  Six bugs surfaced and were
+fixed; the audit also drove three new tripwires and one new
+cross-check, all of which immediately exercise the fixes.
+
+### Audit findings + fixes
+
+| # | Bug | Manifest | Fix |
+|---|---|---|---|
+| 1 | Six early-out paths in `KSPSolve_GMSTAB` returned without `x_local += x_global`. For a zero initial guess `x_global` is 0 throughout (no restart fires before the early-out can trigger), so the bug was MASKED by the bit-equivalence harness. For a non-zero initial guess (`KSPSetInitialGuessNonzero`) the user got a partial cycle update instead of a valid solution. Affected paths: post-init convergence, beta-below-abstol, force_l1_only return, force_l2_only return, natural-flow post-init dup convergence/abstol. | User code calling `KSPSolve` with a non-zero initial guess gets an `x` that satisfies `‖b−A·x‖ ≈ ‖x0‖` instead of `‖b−A·x‖ ≤ tolabs`. KSP-reported rnorm and externally-measured rnorm DIVERGE. | Inserted `VecAXPY(x_local, 1.0, gms->x_global)` before each early-out. Caught by new `ex_gmstab_natural_nzg`. |
+| 2 | `VecDuplicate` into a non-NULL pointer leaks the prior Vec. KSPSolve_GMSTAB allocated `gms->b_local`, `gms->x_global`, `gms->r`, `gms->work_n`, `gms->work_n2` without first destroying any prior values. Multi-solve without `KSPReset` between leaks N×O(s)·sizeof(double) per call. | Memory accumulates linearly with the number of `KSPSolve` invocations on the same KSP. | Added `VecDestroy` of each on KSPSolve entry; same for `gms->V0`/`V1`/`Z`. Caught by new `ex_gmstab_multisolve`. |
+| 3 | `gms->trace_fp` opened only when `!gms->trace_fp`, so on a second `KSPSolve` the file handle stayed open and the new snapshots were APPENDED to the prior solve's trace. | Trace CSV from a multi-solve test had two solves' worth of rows with no separator. Validator parsing would fail or read the wrong rows. | On every KSPSolve entry, close the existing handle (if any) and reopen with mode `"w"`. |
+| 4 | `gms->V0` / `gms->V1` / `gms->Z` lazy-allocated by Init with `if (!gms->V0) MatCreate(...)`. If a user changes `s` between solves (via `-ksp_gmstab_s` re-set or `KSPGMSTABSetS`), the existing matrices are at the OLD size; the lazy-alloc skips re-creation and Init writes into stale columns. For s_new > s_old this hits a PETSc out-of-range column error; for s_new < s_old we silently use stale columns from the previous solve. | Crash (s increasing) or silent stale-data use (s decreasing) on second solve with different s. | Free V0/V1/Z on KSPSolve entry; Init re-allocates at the new size. Caught by new `ex_gmstab_schange`. |
+| 5 | `gms->beta_max` set BEFORE Initialisation (to pre-init `‖r‖`) but C++ sets it AFTER (to `max(beta_post_init, betaLocal)`). For zero initial guess these are equal; with non-zero or under unusual init behaviour they diverge. | Restart heuristic on first natural-flow iter triggers slightly differently than C++. | Overwrite `gms->beta_max = max(beta_curr, beta_local)` AFTER Init returns, before entering the natural-flow loop. |
+| 6 | `KSPGMSTABSnapshot_Private` (helper, not new) — verified during audit that it correctly handles the constructor special-case (`snapshot_count == 0` → return `iter_norm` as `norm_true` without recomputing). No bug here, but the audit confirmed the contract. | n/a | n/a |
+| 7 | (pass 2) `gmstab_cycle1.c:112-115` early-return on `beta < abstol` after StabCoeffs (chk03 region) emitted a snapshot before returning. C++ at `solver.cpp:171-174` returns WITHOUT a snapshot in this branch; the driver's outer `if (beta <= tolabs) break` catches it on the next iter. Latent — `cdr_small` doesn't trip this because beta jumps UP at StabCoeffs in cycle 1; would surface on a problem where the polynomial step happens to drive the residual exactly into convergence on the first cycle. | One extra snapshot row in the trace vs C++; trace structure off by one for any run that ever takes this branch. | Removed the snapshot from the early-return branch; comment now points to the C++ line being mirrored. |
+| 8 | (pass 2) When `init`'s inner gmres converges in <s steps PETSc init bails early (skipping the post-gmres Y/eta/Z calcs) and emits ONE snapshot. The natural-flow / force_l\*_only branches previously emitted the post-init duplicate snapshot as the FIRST line of their respective blocks, *after* the convergence early-out — so on the gmres-converged path PETSc emitted 1 init-related snapshot vs C++'s 2 (init's internal final + driver's `solver.cpp:743` dup). Latent — `cdr_small` doesn't trip this because gmres reduces beta from 1.16 to ~0.36 in 4 iters (not below tolabs); some easy cases in the cdr_sweep validation will. | Trace row count off by one whenever inner gmres converges in init. | Unified the post-init duplicate snapshot to fire UNCONDITIONALLY after Init returns, before any early-out / mode-branch logic. force_l\*_only branches and the natural-flow loop entry no longer emit their own post-init dup. |
+| 9 | (pass 3) `KSPGMSTABBuildDefaultShadow_Private` initialised `gms->prand` only once (on first KSPSolve) and never re-seeded it. C++'s `default_shadow_space` constructs a fresh `std::mt19937_64` from the seed on every call — so two consecutive PETSc solves with the default-RNG shadow path consumed RNG state left over from the prior solve and produced a *different* P each time. Different P → different algorithm trajectory → `‖x1 − x2‖₂ ≠ 0` even with identical inputs. Latent — `cdr_small` validation harness uses `-ksp_gmstab_p_file`, not the RNG path; production users running the same problem twice in one process would see non-deterministic output. | Multi-solve through the default-RNG path returns different x's on the same KSP. | Re-seed `gms->prand` on EVERY call to `KSPGMSTABBuildDefaultShadow_Private` (not just first). Caught by new `ex_gmstab_multisolve_rng`, which exercises the previously-untested default-RNG multi-solve path and asserts `‖x1 − x2‖₂ = 0`. **Negative-test verified:** with the fix temporarily reverted, the tripwire reports rnorm mismatch (9.05e-11 vs 7.44e-11) and `‖x1 − x2‖₂ = 2.74e-10`, correctly catching the regression. |
+| 10 | (pass 4 — defensive cleanup) `KSPGMSTABInnerWorkspaceCreate_Private` left `ws->matvec_count_ptr` uninitialised. Callers always set it immediately after the create call (`ws.matvec_count_ptr = &gms->matvec_count` at gmstab.c:174), so production paths are safe — but a future caller that forgets to set it would dereference stack garbage on every counted matvec. | Latent. No current path triggers it. | Initialise `ws->matvec_count_ptr = NULL` at the top of `KSPGMSTABInnerWorkspaceCreate_Private`; the three counter sites (`gmres_m`, `pgmres_m`, `aug_gmres_m`) already null-check before dereferencing. |
+
+### Pass 4 — init-once-never-reset hunt (driven by the pass-3 RNG bug)
+
+After pass 3 surfaced a "create once, never reset" pattern, did a
+deliberate sweep for analogous patterns across the gmstab port:
+
+| Resource | Pattern | Status |
+|---|---|---|
+| `gms->prand` | lazy-init `if (!gms->prand)` | FIXED in pass 3 — now re-seeded every call |
+| `gms->work_n` | lazy-init in `SnapshotLocal_Private` | OK — destroyed at top of every `KSPSolve` (pass 1) |
+| `gms->Z`, `gms->V0`, `gms->V1` | lazy-init in `Initialisation_Private` | OK — destroyed at top of every `KSPSolve` (pass 1) |
+| `gms->P`, `gms->P_user`, `gms->P_file` | dispatch-time selection | OK — every `KSPSolve` re-builds via the precedence cascade |
+| `gms->trace_fp` | open-once | FIXED in pass 1 — now closed-and-reopened every `KSPSolve` |
+| `gms->snapshot_count`, `matvec_count`, `cycle_count`, `n2cycles`, `_last_logged_matvec_count`, `t_total`, `t_mv`, `ksp->its` | counters | OK — explicit reset at top of `KSPSolve` |
+| `ksp->reason`, `ksp->rnorm0` | per-solve KSP state | OK — PETSc's `KSPSolve` resets `ksp->reason = KSP_CONVERGED_ITERATING` at line 351 of `itfunc.c`; `KSPConvergedDefault` resets `rnorm0` whenever `n == 0`, which fires on our reset `ksp->its == 0` constructor snapshot |
+| `ws->matvec_count_ptr` | uninitialised stack | FIXED in pass 4 — null-init in `WorkspaceCreate` to guard against future callers that forget |
+| `gmstab1_call_count` / `gmstab2_call_count` (C++) | static counter that limits dumps to first invocation | DELIBERATELY NOT MIRRORED — PETSc dump helpers are stateless and clobber the dump dir on every cycle invocation; only matters for diagnostic runs (force_l\*_only / single-cycle), and only those modes are used with dumps. Documented limitation. |
+
+No file-scope or function-local `static` variables exist in the gmstab
+sources (verified by `grep -n "^[[:space:]]*static [^(]"`). All mutable
+state is either struct-resident with explicit per-solve reset, or
+inner-workspace-resident and per-solve allocated/destroyed.
+
+### New tripwires that exercise the fixes
+
+* **`ex_gmstab_natural_nzg`** (sequential + n=2,4,8): runs the full
+  natural flow with `KSPSetInitialGuessNonzero` and `x0 = 0.7·𝟙`. The
+  externally measured `‖b − A·x_returned‖` must be ≤ `1.5·abstol` AND
+  equal the KSP-reported rnorm to FP precision. Without the fix this
+  fails by ~9 orders of magnitude (external residual ≈ ‖x0‖ ≈ 18).
+* **`ex_gmstab_determinism`** (sequential + n=2,4,8): runs natural-flow
+  twice on a fresh KSP each time. Asserts the two trace CSVs are
+  BYTE-IDENTICAL (currently 19–20 KB each, zero divergence). Catches any
+  non-deterministic operation introduced by future changes.
+* **`ex_gmstab_multisolve`** (sequential + n=2,4,8): calls `KSPSolve`
+  twice on the SAME KSP object. Asserts identical iter count, identical
+  rnorm, and `‖x1 − x2‖₂ = 0` exactly. Catches per-solve state-not-reset
+  bugs (counters, V0/V1/Z, trace_fp, etc.). Uses `-ksp_gmstab_p_file` so
+  the shadow space is identical across solves by construction.
+* **`ex_gmstab_multisolve_rng`** (audit pass 3) (sequential + n=2,4,8):
+  multi-solve via the default-RNG shadow-space path. Same gates as
+  `ex_gmstab_multisolve` but DOES NOT pass `-ksp_gmstab_p_file`. Catches
+  the RNG-state bug where `gms->prand` carried state from solve 1 to
+  solve 2 instead of being re-seeded.
+* **`ex_gmstab_schange`** (sequential + n=2,4,8): calls `KSPSolve` with
+  s=2, then re-sets `-ksp_gmstab_s` to 6, then calls `KSPSolve` again
+  on the same KSP. Asserts both solves reach ATOL with externally-
+  measured ‖b−A·x‖ ≤ 1.5·abstol AND that the internal rnorm matches the
+  external one to FP precision (which is only true if V0/V1/Z were
+  re-allocated at the new size — otherwise the second solve either
+  crashes via an out-of-range MatDenseGetColumnVec or silently uses
+  stale columns from the prior solve).
+* **`diff_natural_seq_vs_par.py`** cross-check (n=2 and n=4 against
+  seq): both runs use LAPACK on identical inputs, so the only source of
+  divergence in the gauge-independent Init prefix is MPI Allreduce
+  reordering. Observed worst drift: 8.88e-16 (n=2), 2.83e-15 (n=4) —
+  five orders of magnitude under the 1e-10 gate. Catches any future
+  parallel-only code path that introduces gauge change.
+
+### Force_l1 / Force_l2 reverification
+
+The user explicitly asked for both force-modes to be re-verified.
+`ex_gmstab_cycle1` (force_l1) and `ex_gmstab_cycle2` (force_l2) were
+already in the suite and continue to PASS at machine precision against
+their respective C++ baselines:
+
+| validator | mode | drift vs C++ baseline | rank counts |
+|---|---|---|---|
+| `ex_gmstab_cycle1` | `-ksp_gmstab_force_l1_only` | 1.31e-12 | 1, 2, 4, 8 |
+| `ex_gmstab_cycle2` | `-ksp_gmstab_force_l2_only` | 5.26e-12 | 1, 2, 4, 8 |
+
+Both also have dump-level seq-vs-parallel cross-checks at n=2,4 that
+PASS at ≤ 1.4e-12 worst drift (using the same LAPACK on both sides).
+
+## Bug taxonomy — patterns and detection techniques
+
+Across the four audit passes of Phase 3d, ten bugs were found. Persisting
+them here as a reference for future porting work — both for cdr_sweep
+validation in Phase 5a and for any subsequent ports of similar
+algorithms. Each bug is characterised by *what kind of mistake it was*,
+*what scenario triggers it*, and *what audit technique catches it*.
+
+### Bug catalog
+
+| # | Pass | Site | Trigger | Latent on existing tests? |
+|---|---|---|---|---|
+| 0 | (during impl) | 9 snapshot sites in cycle1/2, gmstab.c, init | Restart fires (so `x_global ≠ 0`) | Yes — cdr_small with zero init guess and no restart never triggers |
+| 1 | 1 | 6 early-out paths in `KSPSolve_GMSTAB` | `KSPSetInitialGuessNonzero` + early termination | Yes — all tests used `x0 = 0` |
+| 2 | 1 | `VecDuplicate` of `b_local`/`x_global`/`r`/etc. | Two `KSPSolve` calls without `KSPReset` between | Yes — every test created a fresh KSP |
+| 3 | 1 | `trace_fp` opened only when NULL | Multi-solve with `trace_csv` set | Yes — same |
+| 4 | 1 | `V0`/`V1`/`Z` lazy-init `if (!gms->V0)` | Multi-solve with `s` changed between | Yes — same |
+| 5 | 1 | `gms->beta_max` set BEFORE Init | `betaMax` should be `max(post-Init, pre-Init)` per C++ | Partially — wrong on first restart-trigger, usually masked because pre-Init ≥ post-Init |
+| 7 | 2 | `gmstab_cycle1.c:112-115` early-return after StabCoeffs | `beta` drops below `abstol` exactly at chk03 | Yes — cdr_small's polynomial step jumps beta UP at chk03 |
+| 8 | 2 | post-init dup snapshot inside force/natural blocks | Inner gmres converges in <s steps | Yes — cdr_small needs >4 inner gmres iters |
+| 9 | 3 | `gms->prand` re-seeding | Multi-solve via default-RNG shadow path | Yes — all tests used `-ksp_gmstab_p_file` |
+| 10 | 4 | `ws->matvec_count_ptr` uninitialised | Future refactor that omits the immediate-after-Create assignment | Yes — current callers all set it |
+
+(Bug #6 was an audit-only verification of `KSPGMSTABSnapshot_Private`'s
+constructor special-case, not an actual bug.)
+
+### Pattern A: "Init-once-never-reset" (4 bugs: 2, 3, 4, 9)
+
+State allocated/initialised on the first `KSPSolve` is reused on
+subsequent solves without being reset to its post-construction state.
+
+| Bug | Resource | What carried over |
+|---|---|---|
+| 2 | `Vec`s (`b_local`, `x_global`, `r`, `work_n`, `work_n2`) | Old Vec leaked when `VecDuplicate` overwrote the pointer |
+| 3 | `trace_fp` file handle | Second solve appended to first's CSV |
+| 4 | `V0`/`V1`/`Z` (sized by `s`) | Wrong size if `s` changed between solves |
+| 9 | `gms->prand` RNG | State advanced through previous draws → different `P` |
+
+**Audit technique.** Enumerate every lazily-allocated resource and ask
+"what happens on the second call?" The visual signature is
+`if (!gms->X) { create X }` — a giveaway that subsequent calls reuse.
+
+**Tripwire pattern.** Multi-solve test that runs `KSPSolve` twice on the
+same KSP and asserts byte-identical output (or `‖x1 − x2‖ = 0`).
+`ex_gmstab_multisolve` (file-loaded P) catches bugs 2, 3, 4;
+`ex_gmstab_multisolve_rng` (default-RNG P) catches bug 9.
+
+### Pattern B: "Multi-path invariant violation" (2 bugs: 0, 1)
+
+Many code paths reach a common point, but not all of them maintain the
+same invariant. One or two paths skip the bookkeeping the rest do.
+
+| Bug | Common invariant | Paths that violated it |
+|---|---|---|
+| 0 | Snapshots receive `x_total = x_global + x_local` | 9 sites passed `x_local` directly |
+| 1 | On exit, `x_local` contains the full solution (`x_local += x_global`) | 6 early-out paths skipped the accumulation |
+
+**Audit technique.** Enumerate every return / exit / branch leaving the
+code region. Verify each maintains the post-condition. The simplest
+diagnostic: `grep` for the function's exit primitive
+(`PetscFunctionReturn`, `goto cleanup`, `break`, `return`) and audit
+each site individually against a written invariant.
+
+**Tripwire pattern.** Test the OFF-DIAGONAL paths (the rare ones), not
+just the canonical happy-path. `ex_gmstab_natural_nzg` (nonzero guess)
+forces `x_global ≠ 0` and catches bug 1's early-out skipping.
+
+### Pattern C: "Snapshot rhythm divergence from reference" (3 bugs: 0, 7, 8)
+
+PETSc emits snapshots at slightly different points than the C++
+reference, producing extra/missing rows in the trace CSV.
+
+| Bug | C++ behavior | PETSc behavior (before fix) |
+|---|---|---|
+| 0 | C++'s `perf.read(xGlobal + x, beta)` | PETSc's `Snapshot(x_local, beta)` — wrong x_total |
+| 7 | C++ returns from cycle1 chk03 region without `perf.read` | PETSc emitted a snapshot before returning |
+| 8 | C++ always emits init's `perf.read` + driver's post-init dup (2 snapshots) | PETSc emitted only 1 when init's gmres converged early |
+
+**Audit technique.** Line-by-line cross-reference between the reference
+and the port, focusing on every `perf.read` / snapshot site. Build a
+table: "C++ line → PETSc line → context." Mismatches in count or
+position are usually bugs.
+
+**Tripwire pattern.** Trace bit-equivalence harness
+(`ex_gmstab_cycle1`/`cycle2`/`natural`) with row-by-row comparison. Hard
+to make 100% reliable for cdr_small alone — many rhythm bugs only
+surface on edge-case convergence patterns (e.g. bug 7 needs beta exactly
+at chk03 to cross abstol; bug 8 needs gmres to converge in <s iters).
+Phase 5a's full cdr_sweep validation will exercise more edge cases.
+
+### Pattern D: "Off-by-statement bookkeeping" (1 bug: 5)
+
+State variable is updated, but at the wrong place in the sequence —
+the value at the read site differs from what the reference produces
+because order-of-operations matters.
+
+| Bug | C++ order | PETSc order (before fix) |
+|---|---|---|
+| 5 | `Init(...); betaMax = max(post-Init beta, pre-Init beta);` | `betaMax = pre-Init beta; Init(...);` (no overwrite) |
+
+**Audit technique.** For each scalar field with a "computed at solve
+start" semantic, walk through the C++ code and find the EXACT moment
+its value is first read. Match that moment in PETSc.
+
+**Tripwire pattern.** Hard to write a focused tripwire — bug only
+manifests on inputs that exercise the relevant boundary (here: a
+post-init beta that triggers a specific restart pattern). The
+natural-flow validator's matvec column ends up sensitive indirectly.
+
+### Pattern E: "Latent uninitialised state" (1 bug: 10)
+
+A stack-allocated struct field is never explicitly initialised; it
+works because every current caller sets it immediately after
+construction. Latent — a future refactor could regress.
+
+**Audit technique.** Scan struct construction sites. For each field of
+the struct, verify it's either zeroed by `PetscNew`/`PetscCalloc` or
+explicitly assigned in the constructor. `KSPGMSTABInnerWorkspace` is
+stack-allocated by the caller, so it's especially exposed.
+
+**Tripwire pattern.** Code review primarily. Hard to catch with runtime
+tests because production paths always set the field.
+
+### Pattern frequency
+
+| Pattern | Count | Fraction |
+|---|---|---|
+| A: Init-once-never-reset | 4 | 40% |
+| B: Multi-path invariant violation | 2 | 20% |
+| C: Snapshot rhythm divergence | 3 | 30% |
+| D: Off-by-statement bookkeeping | 1 | 10% |
+| E: Latent uninitialised state | 1 | 10% |
+
+(C and B overlap — Bug 0 falls in both.)
+
+Pattern A dominated, which is why pass 4 was dedicated to it. Pattern C
+was second most common: **trace-rhythm cross-referencing deserves its
+own systematic step** in any future port-with-bit-equivalence-validation
+effort.
+
+### Audit checklist for the next phase
+
+Translating each pattern into a concrete checklist for Phase 4 / 5a:
+
+1. **Multi-solve every state field.** For each `gms->X`, ask: "if I
+   call `KSPSolve` twice, does X get the same value at the start of
+   solve 2 as it had at the start of solve 1?" If lazy-allocated, the
+   answer is usually no — fix at the top of `KSPSolve_GMSTAB`.
+2. **Enumerate all exit paths.** Before declaring a function done,
+   `grep` every `PetscFunctionReturn`/`return`/`break` and walk a
+   checklist: does this exit maintain the function's post-conditions?
+3. **Snapshot rhythm = strict 1:1 mapping with reference.** Build a
+   numbered table cross-referencing every reference `perf.read` to its
+   PETSc equivalent. Catch mismatches at writing time, not validation
+   time.
+4. **Order-of-operations matters for scalar fields.** When a field has
+   multiple plausible "set" sites, the right one is whichever the
+   reference uses — at the same logical position.
+5. **Defensive zero-init is cheap insurance.** Every struct field not
+   already zeroed by `PetscNew` should be explicitly set in
+   `Create`/`Init` functions. Stack-allocated structs need explicit
+   initialisation of every field.
 
 ## How to resume
 
@@ -483,18 +821,8 @@ recipe as cycle 1:
 cd /home/sam/hpc_stack/petsc
 git status   # should be clean on ksp-gmstab
 src/ksp/ksp/impls/gmstab/tests/run_gmstab_tripwires.sh
-# Expect: 3/3 PASS
+# Expect: 40/40 PASS
 
-# 2. Generate the cycle 1 dump set (re-confirms checkpoint-level bit-equivalence)
-rm -f /tmp/gmstab_dump/*.csv
-GMSTAB_DUMP_DIR=/tmp/gmstab_dump GMSTAB_FORCE_L1=1 \
-    /home/sam/hpc_stack/gmstab_cpp/build/gmstab_run \
-    --linsys .../cdr_small/linsys.bin --P_bin .../cdr_small/P.bin \
-    --s 4 --tol 1e-10 --maxmatvec 500 --maxruntime 30 \
-    --out /tmp/cpp_run.csv >/dev/null
-GMSTAB_DUMP_DIR=/tmp/gmstab_dump /tmp/ex_gmstab_cycle1 >/dev/null
-python3 src/ksp/ksp/impls/gmstab/tests/diff_gmstab_dumps.py /tmp/gmstab_dump
-# Expect: 41 ok, 1 DRIFT (chk04 V0_postBGS — documented noise)
-
-# 3. Begin cycle 2 implementation per the recipe above.
+# 2. Move on to Phase 4 (preconditioner sides) or Phase 5a (full
+#    sweep validation against the 129 baselines).
 ```

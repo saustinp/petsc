@@ -109,13 +109,18 @@ PETSC_INTERN PetscErrorCode KSPGMSTABCycle1_Private(KSP ksp, KSP_GMSTAB *gms,
   PetscCall(KSPGMSTABDumpVec_Private(3, "x",  x_local));
   PetscCall(KSPGMSTABDumpVec_Private(3, "r0", r0));
 
+  /* C++ solver.cpp:171-174 returns from cycle1 here WITHOUT emitting a
+     perf.read when beta has already crossed below tolabs (the polynomial
+     step at chk03 happens to bring beta into convergence). The driver
+     then breaks at "if (beta <= tolabs)". Mirror that exactly: skip the
+     mid-cycle snapshot in this branch, so the trace stays bit-equivalent
+     under any path that exits the cycle here. */
   if (beta < ksp->abstol) {
-    PetscCall(KSPGMSTABSnapshot_Private(ksp, gms, x_local, beta));
     *beta_io = beta;
     PetscFunctionReturn(PETSC_SUCCESS);
   }
-  /* Mid-cycle snapshot per the C++ port. */
-  PetscCall(KSPGMSTABSnapshot_Private(ksp, gms, x_local, beta));
+  /* Mid-cycle snapshot per the C++ port (solver.cpp:175-177). */
+  PetscCall(KSPGMSTABSnapshotLocal_Private(ksp, gms, x_local, beta));
   if (ksp->reason && ksp->reason != KSP_CONVERGED_ITERATING) {
     *beta_io = beta;
     PetscFunctionReturn(PETSC_SUCCESS);
@@ -411,7 +416,7 @@ PETSC_INTERN PetscErrorCode KSPGMSTABCycle1_Private(KSP ksp, KSP_GMSTAB *gms,
   }
 
   /* (8) Convergence check / termination. */
-  PetscCall(KSPGMSTABSnapshot_Private(ksp, gms, x_local, beta));
+  PetscCall(KSPGMSTABSnapshotLocal_Private(ksp, gms, x_local, beta));
   if (beta < ksp->abstol || (ksp->reason && ksp->reason != KSP_CONVERGED_ITERATING) || inner_terminated) {
     *beta_io = beta;
     PetscCall(PetscFree(QfQz));
@@ -612,7 +617,7 @@ PETSC_INTERN PetscErrorCode KSPGMSTABCycle1_Private(KSP ksp, KSP_GMSTAB *gms,
   *beta_io = beta;
 
   /* (11) Final cycle snapshot. */
-  PetscCall(KSPGMSTABSnapshot_Private(ksp, gms, x_local, beta));
+  PetscCall(KSPGMSTABSnapshotLocal_Private(ksp, gms, x_local, beta));
 
   PetscCall(PetscFree(c0));
   PetscCall(PetscFree2(Yxi, ZinvYxi));

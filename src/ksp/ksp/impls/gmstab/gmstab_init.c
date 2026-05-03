@@ -79,7 +79,7 @@ PETSC_INTERN PetscErrorCode KSPGMSTABInitialisation_Private(KSP ksp, KSP_GMSTAB 
     *beta_io = beta_g;
     PetscCall(VecDestroy(&x_init));
     PetscCall(VecDestroy(&r_init));
-    PetscCall(KSPGMSTABSnapshot_Private(ksp, gms, x_local, beta_g));
+    PetscCall(KSPGMSTABSnapshotLocal_Private(ksp, gms, x_local, beta_g));
     PetscFunctionReturn(PETSC_SUCCESS);
   }
 
@@ -263,7 +263,7 @@ PETSC_INTERN PetscErrorCode KSPGMSTABInitialisation_Private(KSP ksp, KSP_GMSTAB 
   *beta_io = beta_out;
 
   /* Snapshot per the C++ port (Initialisation calls perf.read at end). */
-  PetscCall(KSPGMSTABSnapshot_Private(ksp, gms, x_local, beta_out));
+  PetscCall(KSPGMSTABSnapshotLocal_Private(ksp, gms, x_local, beta_out));
 
   PetscCall(PetscFree(c0));
   PetscCall(PetscFree3(inner, xi, temp));

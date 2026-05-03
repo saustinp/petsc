@@ -19,6 +19,22 @@
  *   Also feeds the iter_norm into the standard PETSc convergence machinery
  *   (KSPMonitor + (*ksp->converged)) so user-set tolerances apply.
  * ============================================================================ */
+PETSC_INTERN PetscErrorCode KSPGMSTABSnapshotLocal_Private(KSP ksp, KSP_GMSTAB *gms,
+                                                            Vec x_local, PetscReal iter_norm)
+{
+  PetscFunctionBegin;
+  /* Build x_total = gms->x_global + x_local in gms->work_n (lazily
+     allocated). We use gms->work_n (not ws->work_n) because cycle1 /
+     cycle2 internals already use ws->work_n for inner-kernel scratch. */
+  if (!gms->work_n) {
+    PetscCall(VecDuplicate(x_local, &gms->work_n));
+  }
+  PetscCall(VecCopy(gms->x_global, gms->work_n));
+  PetscCall(VecAXPY(gms->work_n, 1.0, x_local));
+  PetscCall(KSPGMSTABSnapshot_Private(ksp, gms, gms->work_n, iter_norm));
+  PetscFunctionReturn(PETSC_SUCCESS);
+}
+
 PETSC_INTERN PetscErrorCode KSPGMSTABSnapshot_Private(KSP ksp, KSP_GMSTAB *gms,
                                                        Vec x_total, PetscReal iter_norm)
 {
@@ -141,14 +157,23 @@ PETSC_INTERN PetscErrorCode KSPGMSTABBuildDefaultShadow_Private(KSP ksp, KSP_GMS
 
   /* Use PETSc's PetscRandom with NORMAL distribution. Same statistical
      properties as MATLAB's randn (Gaussian N(0,1)) but DIFFERENT state
-     traversal so NOT bit-equivalent. */
+     traversal so NOT bit-equivalent.
+
+     CRITICAL: re-seed on EVERY call (not just first). The C++ port's
+     default_shadow_space() constructs a fresh std::mt19937_64 from the
+     seed each time, so two consecutive `KSPSolve`s with default-RNG
+     shadow space get the *same* P. Without re-seeding, the second solve
+     would consume RNG state left over from the first and produce a
+     different P, which then drives the algorithm down a different
+     trajectory — breaking determinism guarantees the multi-solve
+     tripwire enforces. */
   if (!gms->prand) {
     PetscCall(PetscRandomCreate(PetscObjectComm((PetscObject)ksp), &gms->prand));
     PetscCall(PetscRandomSetType(gms->prand, PETSCRAND));
     PetscCall(PetscRandomSetInterval(gms->prand, -1.0, 1.0));    /* will be overridden */
-    PetscCall(PetscRandomSetSeed(gms->prand, gms->rng_seed));
-    PetscCall(PetscRandomSeed(gms->prand));
   }
+  PetscCall(PetscRandomSetSeed(gms->prand, gms->rng_seed));
+  PetscCall(PetscRandomSeed(gms->prand));
 
   /* Fill columns of P with N(0,1) values via uniform → normal Box-Muller.
      PETSc has PETSCRANDER48 (uniform) and PETSCRAND (uniform); for
